@@ -468,6 +468,12 @@ def _page_live_quotes(settings: AppSettings, storage: Storage, selected_pairs: l
             display.style.apply(_row_color, axis=1),
             use_container_width=True,
             hide_index=True,
+            column_config={
+                "bid": st.column_config.NumberColumn("Bid", format="%.5f"),
+                "ask": st.column_config.NumberColumn("Ask", format="%.5f"),
+                "mid": st.column_config.NumberColumn("Mid", format="%.5f"),
+                "spread_pips": st.column_config.NumberColumn("Spread (pips)", format="%.1f"),
+            },
         )
 
         st.caption(
