@@ -308,7 +308,12 @@ def _page_scanner(
             display["pair"] = display["pair"].apply(format_pair)
             display["trade_signal"] = display["trade_signal"].apply(_signal_badge)
 
-            st.dataframe(display, use_container_width=True, hide_index=True)
+            price_cols = {c: "{:.5f}" for c in ["bid", "ask", "close", "ema9", "ema20"] if c in display.columns}
+            st.dataframe(
+                display.style.format(price_cols),
+                use_container_width=True,
+                hide_index=True,
+            )
 
             # Column guide
             with st.expander("Column Guide"):
@@ -464,16 +469,13 @@ def _page_live_quotes(settings: AppSettings, storage: Storage, selected_pairs: l
 
         display_cols = ["pair", "bid", "ask", "mid", "spread_pips", "as_of"]
         display = qdf[[c for c in display_cols if c in qdf.columns]]
+        price_fmt = {c: "{:.5f}" for c in ["bid", "ask", "mid"] if c in display.columns}
+        if "spread_pips" in display.columns:
+            price_fmt["spread_pips"] = "{:.1f}"
         st.dataframe(
-            display.style.apply(_row_color, axis=1),
+            display.style.apply(_row_color, axis=1).format(price_fmt),
             use_container_width=True,
             hide_index=True,
-            column_config={
-                "bid": st.column_config.NumberColumn("Bid", format="%.5f"),
-                "ask": st.column_config.NumberColumn("Ask", format="%.5f"),
-                "mid": st.column_config.NumberColumn("Mid", format="%.5f"),
-                "spread_pips": st.column_config.NumberColumn("Spread (pips)", format="%.1f"),
-            },
         )
 
         st.caption(
