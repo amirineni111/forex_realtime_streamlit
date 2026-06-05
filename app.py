@@ -1,0 +1,504 @@
+from __future__ import annotations
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+
+import pandas as pd
+import streamlit as st
+from streamlit_autorefresh import st_autorefresh
+
+from forex.config import AppSettings, get_settings
+from forex.market_sessions import current_session, is_forex_market_open, session_badge_color
+from forex.models import ScanRequest
+from forex.pairs import UNIVERSE_MAP, format_pair
+from forex.scanner import run_scan
+from forex.storage import Storage
+
+st.set_page_config(
+    page_title="Forex Trading Dashboard",
+    page_icon="💱",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# ── Persistence helpers ──────────────────────────────────────────────────────
+
+PREFS_PATH = Path("data/app_preferences.json")
+
+
+def _load_prefs() -> dict:
+    if PREFS_PATH.exists():
+        try:
+            return json.loads(PREFS_PATH.read_text())
+        except Exception:
+            pass
+    return {}
+
+
+def _save_prefs(d: dict) -> None:
+    PREFS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    PREFS_PATH.write_text(json.dumps(d, indent=2))
+
+
+# ── Session state init ───────────────────────────────────────────────────────
+
+def _init_state() -> None:
+    prefs = _load_prefs()
+    defaults = {
+        "oanda_api_key": prefs.get("oanda_api_key", ""),
+        "oanda_account_id": prefs.get("oanda_account_id", ""),
+        "oanda_env": prefs.get("oanda_env", "practice"),
+        "auto_refresh": prefs.get("auto_refresh", False),
+        "refresh_seconds": prefs.get("refresh_seconds", 60),
+        "auto_refresh_count_last": 0,
+        "quotes_auto_refresh_count_last": 0,
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+
+_init_state()
+
+# ── Settings builder ─────────────────────────────────────────────────────────
+
+def _build_settings() -> AppSettings:
+    env_settings = get_settings()
+    return AppSettings(
+        oanda_api_key=st.session_state.oanda_api_key or env_settings.oanda_api_key,
+        oanda_account_id=st.session_state.oanda_account_id or env_settings.oanda_account_id,
+        oanda_env=st.session_state.oanda_env,
+        db_path=env_settings.db_path,
+    )
+
+
+# ── Signal color ─────────────────────────────────────────────────────────────
+
+SIGNAL_COLORS = {
+    "STRONG_BUY": "🟢",
+    "BUY_CANDIDATE": "🔵",
+    "WATCH_ONLY": "🟡",
+    "AVOID": "⚫",
+    "SHORT_CANDIDATE": "🟠",
+    "STRONG_SHORT": "🔴",
+}
+
+
+def _signal_badge(signal: str) -> str:
+    return f"{SIGNAL_COLORS.get(signal, '⚫')} {signal}"
+
+
+# ── Sidebar ──────────────────────────────────────────────────────────────────
+
+def _render_sidebar() -> tuple:
+    st.sidebar.title("💱 Forex Dashboard")
+
+    # Session status
+    session = current_session()
+    market_open = is_forex_market_open()
+    badge = session_badge_color(session)
+    st.sidebar.markdown(f"**Session:** {badge} {session.replace('_', ' ')}")
+    if not market_open:
+        st.sidebar.warning("Forex market is closed (weekend).")
+
+    st.sidebar.divider()
+
+    # API credentials
+    st.sidebar.subheader("OANDA Credentials")
+    api_key = st.sidebar.text_input(
+        "API Key",
+        value=st.session_state.oanda_api_key,
+        type="password",
+        key="input_api_key",
+    )
+    account_id = st.sidebar.text_input(
+        "Account ID (optional — auto-fetched)",
+        value=st.session_state.oanda_account_id,
+        key="input_account_id",
+    )
+    oanda_env = st.sidebar.radio(
+        "Environment",
+        ["practice", "live"],
+        index=0 if st.session_state.oanda_env == "practice" else 1,
+        horizontal=True,
+        key="input_env",
+    )
+
+    if api_key != st.session_state.oanda_api_key:
+        st.session_state.oanda_api_key = api_key
+    if account_id != st.session_state.oanda_account_id:
+        st.session_state.oanda_account_id = account_id
+    if oanda_env != st.session_state.oanda_env:
+        st.session_state.oanda_env = oanda_env
+
+    api_ok = bool(api_key)
+    if api_ok:
+        st.sidebar.success("API key set")
+    else:
+        st.sidebar.error("Enter your OANDA API key")
+
+    st.sidebar.divider()
+
+    # Pair universe
+    st.sidebar.subheader("Pair Universe")
+    universe_choice = st.sidebar.radio(
+        "Universe",
+        list(UNIVERSE_MAP.keys()) + ["Custom"],
+        horizontal=False,
+    )
+    if universe_choice == "Custom":
+        custom_raw = st.sidebar.text_area(
+            "Custom pairs (one per line, e.g. EUR_USD)",
+            height=120,
+            placeholder="EUR_USD\nGBP_USD\nUSD_JPY",
+        )
+        selected_pairs = [
+            p.strip().upper()
+            for p in custom_raw.replace(",", "\n").splitlines()
+            if p.strip()
+        ]
+    else:
+        selected_pairs = UNIVERSE_MAP[universe_choice]
+        st.sidebar.caption(f"{len(selected_pairs)} pairs: {', '.join(format_pair(p) for p in selected_pairs)}")
+
+    st.sidebar.divider()
+
+    # Scan settings
+    st.sidebar.subheader("Scan Settings")
+    max_spread = st.sidebar.slider("Max spread (pips)", 0.5, 5.0, 2.0, 0.1)
+    signal_mode = st.sidebar.selectbox(
+        "Signal mode",
+        ["All", "Momentum", "Mean Reversion", "Session Breakout"],
+    )
+
+    st.sidebar.divider()
+
+    # Auto-refresh
+    st.sidebar.subheader("Auto-Refresh")
+    auto_refresh = st.sidebar.checkbox("Auto-refresh scanner", value=st.session_state.auto_refresh)
+    refresh_secs = st.sidebar.number_input(
+        "Interval (seconds)",
+        min_value=30,
+        max_value=1800,
+        value=st.session_state.refresh_seconds,
+        step=30,
+    )
+    st.session_state.auto_refresh = auto_refresh
+    st.session_state.refresh_seconds = refresh_secs
+
+    # Save prefs
+    _save_prefs({
+        "oanda_api_key": api_key,
+        "oanda_account_id": account_id,
+        "oanda_env": oanda_env,
+        "auto_refresh": auto_refresh,
+        "refresh_seconds": refresh_secs,
+    })
+
+    return api_key, selected_pairs, max_spread, signal_mode, auto_refresh, refresh_secs
+
+
+# ── Scanner page ─────────────────────────────────────────────────────────────
+
+def _page_scanner(
+    settings: AppSettings,
+    storage: Storage,
+    selected_pairs: list,
+    max_spread: float,
+    signal_mode: str,
+    auto_refresh: bool,
+    refresh_secs: int,
+) -> None:
+    st.title("Forex Scanner")
+
+    api_ok = bool(settings.oanda_api_key)
+
+    # Auto-refresh wiring
+    auto_count = None
+    if auto_refresh and api_ok:
+        auto_count = st_autorefresh(interval=refresh_secs * 1000, key="scanner_autorefresh")
+
+    auto_due = (
+        auto_refresh
+        and api_ok
+        and bool(selected_pairs)
+        and auto_count is not None
+        and auto_count != st.session_state.auto_refresh_count_last
+    )
+
+    col1, col2 = st.columns([1, 6])
+    with col1:
+        run_now = st.button("▶ Run Scan", type="primary", disabled=not api_ok or not selected_pairs)
+    with col2:
+        if not api_ok:
+            st.warning("Enter your OANDA API key in the sidebar.")
+        elif not selected_pairs:
+            st.warning("Select or enter forex pairs.")
+
+    if run_now or auto_due:
+        request = ScanRequest(
+            pairs=selected_pairs,
+            max_spread_pips=max_spread,
+            signal_mode=signal_mode,
+        )
+        with st.spinner(f"Scanning {len(selected_pairs)} pairs…"):
+            try:
+                summary = run_scan(settings, storage, request)
+                st.session_state.auto_refresh_count_last = auto_count or 0
+                st.success(
+                    f"Scan complete — {summary.pairs_scanned} pairs, "
+                    f"{summary.signals_found} signals, {summary.errors} errors"
+                )
+            except Exception as exc:
+                st.error(f"Scan failed: {exc}")
+
+    tab_results, tab_watchlist, tab_logs, tab_settings = st.tabs(
+        ["Results", "Watchlist", "Scan Logs", "Settings"]
+    )
+
+    # ── Results tab ──────────────────────────────────────────────────────────
+    with tab_results:
+        rows = storage.load_latest_snapshots()
+        if not rows:
+            st.info("No scan results yet. Click 'Run Scan' to start.")
+        else:
+            df = pd.DataFrame(rows)
+
+            # Metrics row
+            m1, m2, m3, m4 = st.columns(4)
+            last_run = storage.load_latest_scan_run()
+            last_ts = last_run.get("finished_at", "—") if last_run else "—"
+            m1.metric("Pairs Scanned", len(df))
+            m2.metric("Actionable", len(df[df["trade_signal"].isin(["STRONG_BUY", "BUY_CANDIDATE", "STRONG_SHORT", "SHORT_CANDIDATE"])]))
+            m3.metric("Avg Score", f"{df['total_score'].mean():.1f}")
+            m4.metric("Last Scan", last_ts)
+
+            # Filters
+            fc1, fc2 = st.columns(2)
+            all_pairs = sorted(df["pair"].unique().tolist())
+            all_signals = sorted(df["trade_signal"].unique().tolist())
+            pair_filter = fc1.multiselect("Filter pairs", all_pairs, default=[])
+            signal_filter = fc2.multiselect("Filter signals", all_signals, default=[])
+
+            filtered = df.copy()
+            if pair_filter:
+                filtered = filtered[filtered["pair"].isin(pair_filter)]
+            if signal_filter:
+                filtered = filtered[filtered["trade_signal"].isin(signal_filter)]
+
+            # Apply signal mode filter
+            if signal_mode == "Momentum":
+                filtered = filtered[filtered["momentum_score"] >= filtered["reversion_score"]]
+            elif signal_mode == "Mean Reversion":
+                filtered = filtered[filtered["reversion_score"] >= filtered["momentum_score"]]
+            elif signal_mode == "Session Breakout":
+                filtered = filtered[filtered["session_score"] > 0]
+
+            # Format display columns
+            display_cols = [
+                "pair", "trade_signal", "total_score",
+                "momentum_score", "reversion_score", "session_score",
+                "bid", "ask", "spread_pips",
+                "close", "day_change_pct",
+                "rsi14", "macd_histogram", "ema9", "ema20",
+                "atr14", "bb_width_pct",
+                "current_session", "signal_reason", "as_of",
+            ]
+            display = filtered[[c for c in display_cols if c in filtered.columns]].copy()
+            display["pair"] = display["pair"].apply(format_pair)
+            display["trade_signal"] = display["trade_signal"].apply(_signal_badge)
+
+            st.dataframe(display, use_container_width=True, hide_index=True)
+
+            # Column guide
+            with st.expander("Column Guide"):
+                st.markdown("""
+| Column | Description |
+|--------|-------------|
+| pair | Currency pair (e.g. EUR/USD) |
+| trade_signal | Overall signal: STRONG_BUY, BUY_CANDIDATE, SHORT_CANDIDATE, STRONG_SHORT, WATCH_ONLY, AVOID |
+| total_score | Combined score (0–100) |
+| momentum_score | EMA/MACD/RSI momentum component (0–40) |
+| reversion_score | RSI extreme/Bollinger Band component (0–40) |
+| session_score | Session quality/breakout component (0–20) |
+| spread_pips | Bid-ask spread in pips |
+| rsi14 | RSI(14): <30 oversold, >70 overbought |
+| macd_histogram | MACD histogram (positive = bullish momentum) |
+| atr14 | Average True Range — daily volatility measure |
+| bb_width_pct | Bollinger Band width % — squeeze detection |
+| current_session | Active market session |
+                """)
+
+            st.download_button(
+                "Export CSV",
+                display.to_csv(index=False).encode(),
+                file_name="forex_scan.csv",
+                mime="text/csv",
+            )
+
+    # ── Watchlist tab ────────────────────────────────────────────────────────
+    with tab_watchlist:
+        st.subheader("Add to Watchlist")
+        with st.form("add_watchlist"):
+            wc1, wc2, wc3 = st.columns(3)
+            w_pair = wc1.text_input("Pair (e.g. EUR_USD)")
+            w_signal = wc2.selectbox(
+                "Signal",
+                ["STRONG_BUY", "BUY_CANDIDATE", "SHORT_CANDIDATE", "STRONG_SHORT", "WATCH_ONLY"],
+            )
+            w_entry = wc3.number_input("Entry price", min_value=0.0, format="%.5f")
+            wc4, wc5, wc6 = st.columns(3)
+            w_target = wc4.number_input("Target price", min_value=0.0, format="%.5f")
+            w_stop = wc5.number_input("Stop price", min_value=0.0, format="%.5f")
+            w_notes = wc6.text_input("Notes")
+            w_stop_pips = st.number_input("Stop (pips)", min_value=0.0, value=20.0)
+            w_target_pips = st.number_input("Target (pips)", min_value=0.0, value=40.0)
+            submitted = st.form_submit_button("Add")
+            if submitted and w_pair:
+                storage.add_watchlist(
+                    w_pair.strip().upper(), w_signal, w_entry,
+                    w_target, w_stop, w_stop_pips, w_target_pips, w_notes,
+                )
+                st.success(f"Added {format_pair(w_pair)} to watchlist.")
+
+        st.subheader("Active Watches")
+        watching = storage.load_watchlist("watching")
+        if not watching:
+            st.info("No active watches.")
+        else:
+            wdf = pd.DataFrame(watching)
+            wdf["pair"] = wdf["pair"].apply(format_pair)
+            wdf["trade_signal"] = wdf["trade_signal"].apply(_signal_badge)
+            st.dataframe(wdf, use_container_width=True, hide_index=True)
+
+            close_id = st.number_input("Close watch ID", min_value=0, step=1, value=0)
+            if st.button("Close Watch") and close_id > 0:
+                storage.close_watchlist(int(close_id))
+                st.success(f"Closed watch ID {close_id}.")
+                st.rerun()
+
+        with st.expander("Closed Watches"):
+            closed = storage.load_watchlist("closed")
+            if closed:
+                cdf = pd.DataFrame(closed)
+                cdf["pair"] = cdf["pair"].apply(format_pair)
+                st.dataframe(cdf, use_container_width=True, hide_index=True)
+
+    # ── Scan Logs tab ─────────────────────────────────────────────────────────
+    with tab_logs:
+        logs = storage.load_scan_logs()
+        if not logs:
+            st.info("No scan logs yet.")
+        else:
+            ldf = pd.DataFrame(logs)
+            st.dataframe(ldf, use_container_width=True, hide_index=True)
+
+    # ── Settings tab ──────────────────────────────────────────────────────────
+    with tab_settings:
+        last_run = storage.load_latest_scan_run()
+        if last_run:
+            st.json(last_run)
+        else:
+            st.info("No scan runs recorded yet.")
+        st.subheader("Current Request")
+        st.json({
+            "pairs": selected_pairs,
+            "max_spread_pips": max_spread,
+            "signal_mode": signal_mode,
+            "oanda_env": settings.oanda_env,
+        })
+
+
+# ── Live Quotes page ─────────────────────────────────────────────────────────
+
+def _page_live_quotes(settings: AppSettings, storage: Storage, selected_pairs: list) -> None:
+    st.title("Live Quotes")
+
+    api_ok = bool(settings.oanda_api_key)
+
+    # Auto-refresh every 30s on this page
+    auto_count = st_autorefresh(interval=30_000, key="quotes_autorefresh")
+
+    auto_due = (
+        api_ok
+        and bool(selected_pairs)
+        and auto_count != st.session_state.quotes_auto_refresh_count_last
+    )
+
+    col1, col2 = st.columns([1, 6])
+    with col1:
+        fetch_now = st.button("Fetch Quotes", disabled=not api_ok)
+    with col2:
+        session = current_session()
+        badge = session_badge_color(session)
+        st.markdown(f"**Session:** {badge} {session.replace('_', ' ')} — auto-refreshes every 30s")
+
+    if fetch_now or auto_due:
+        if api_ok and selected_pairs:
+            from forex.oanda import OandaClient
+            client = OandaClient(settings)
+            try:
+                quotes = client.get_pricing(selected_pairs)
+                storage.save_quotes(quotes)
+                st.session_state.quotes_auto_refresh_count_last = auto_count
+            except Exception as exc:
+                st.error(f"Failed to fetch quotes: {exc}")
+
+    quotes = storage.load_latest_quotes()
+    if not quotes:
+        st.info("No live quotes yet. Click 'Fetch Quotes' or wait for auto-refresh.")
+    else:
+        qdf = pd.DataFrame(quotes)
+        qdf["pair"] = qdf["pair"].apply(format_pair)
+        qdf["mid"] = ((qdf["bid"] + qdf["ask"]) / 2).round(6)
+
+        # Highlight London/NY overlap rows
+        session = current_session()
+
+        def _row_color(row):
+            if session == "London_NY_Overlap":
+                return ["background-color: #1a3a1a"] * len(row)
+            elif session in ("London", "New_York"):
+                return ["background-color: #1a2a3a"] * len(row)
+            return [""] * len(row)
+
+        display_cols = ["pair", "bid", "ask", "mid", "spread_pips", "as_of"]
+        display = qdf[[c for c in display_cols if c in qdf.columns]]
+        st.dataframe(
+            display.style.apply(_row_color, axis=1),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.caption(
+            f"Session: {session.replace('_', ' ')} | "
+            f"Market open: {'Yes' if is_forex_market_open() else 'No (weekend)'} | "
+            f"Last refresh: {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}"
+        )
+
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    api_key, selected_pairs, max_spread, signal_mode, auto_refresh, refresh_secs = _render_sidebar()
+
+    settings = _build_settings()
+    storage = Storage(settings.db_path)
+
+    page = st.sidebar.radio(
+        "Page",
+        ["Forex Scanner", "Live Quotes"],
+        label_visibility="collapsed",
+    )
+
+    if page == "Forex Scanner":
+        _page_scanner(
+            settings, storage, selected_pairs,
+            max_spread, signal_mode, auto_refresh, refresh_secs,
+        )
+    else:
+        _page_live_quotes(settings, storage, selected_pairs)
+
+
+if __name__ == "__main__":
+    main()

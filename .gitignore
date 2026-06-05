@@ -1,0 +1,63 @@
+# ── Secrets & credentials ──────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── Virtual environment ─────────────────────────────────────────────────────
+venv/
+.venv/
+env/
+ENV/
+
+# ── Database & data files ───────────────────────────────────────────────────
+data/
+*.sqlite3
+*.sqlite3-journal
+*.sqlite3-wal
+*.sqlite3-shm
+*.db
+
+# ── Python cache ────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+.Python
+
+# ── Build / distribution ─────────────────────────────────────────────────────
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+
+# ── Testing & coverage ──────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# ── IDE & editor ────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.suo
+*.user
+*.swp
+*.swo
+*~
+
+# ── OS artifacts ────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Streamlit ───────────────────────────────────────────────────────────────
+.streamlit/secrets.toml
+
+# ── App preferences (local UI state) ────────────────────────────────────────
+data/app_preferences.json
+
+# ── Logs ────────────────────────────────────────────────────────────────────
+*.log
+logs/
