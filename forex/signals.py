@@ -1,5 +1,6 @@
 from __future__ import annotations
-from typing import Optional, Tuple
+import json
+from typing import List, Optional, Tuple
 
 from .market_sessions import current_session
 
@@ -180,6 +181,76 @@ def _session_breakout(
     return round(score, 1), signal, "; ".join(reasons)
 
 
+def _mtf_confluence(
+    m5_dir: Optional[str],
+    h1_dir: Optional[str],
+    h4_dir: Optional[str],
+) -> Tuple[float, str]:
+    """
+    Score multi-timeframe alignment.
+    Full (all 3 agree): +30 pts, "FULL"
+    Two of three agree: +15 pts, "PARTIAL"
+    Conflict/missing: 0 pts, "NONE"
+    """
+    dirs = [d for d in (m5_dir, h1_dir, h4_dir) if d and d != "NEUTRAL"]
+    if not dirs:
+        return 0.0, "NONE"
+    long_count = dirs.count("LONG")
+    short_count = dirs.count("SHORT")
+    total = len(dirs)
+    if long_count == total or short_count == total:
+        return 30.0, "FULL"
+    elif long_count >= 2 or short_count >= 2:
+        return 15.0, "PARTIAL"
+    return 0.0, "NONE"
+
+
+def _sr_proximity(
+    close: Optional[float],
+    atr14: Optional[float],
+    sr_levels: list,
+    dominant_direction: str,
+) -> Tuple[float, str, bool, Optional[float], Optional[float]]:
+    """
+    Score proximity to key S/R levels.
+    Returns (score, reason, at_key_level, nearest_support, nearest_resistance).
+    """
+    if not sr_levels or not close or not atr14 or atr14 == 0:
+        return 0.0, "", False, None, None
+
+    supports = [lv["price"] for lv in sr_levels if lv["type"] == "S" and lv["price"] <= close]
+    resistances = [lv["price"] for lv in sr_levels if lv["type"] == "R" and lv["price"] >= close]
+
+    nearest_support = max(supports) if supports else None
+    nearest_resistance = min(resistances) if resistances else None
+
+    score = 0.0
+    reasons: List[str] = []
+    at_key_level = False
+
+    if nearest_support is not None:
+        dist = (close - nearest_support) / atr14
+        if dist <= 0.3:
+            score += 25
+            at_key_level = True
+            reasons.append(f"AT support {nearest_support:.5f}")
+        elif dist <= 1.0 and dominant_direction == "LONG":
+            score += 15
+            reasons.append(f"Near support {nearest_support:.5f}")
+
+    if nearest_resistance is not None:
+        dist = (nearest_resistance - close) / atr14
+        if dist <= 0.3:
+            score += 25
+            at_key_level = True
+            reasons.append(f"AT resistance {nearest_resistance:.5f}")
+        elif dist <= 1.0 and dominant_direction == "SHORT":
+            score += 15
+            reasons.append(f"Near resistance {nearest_resistance:.5f}")
+
+    return round(min(score, 25), 1), "; ".join(reasons), at_key_level, nearest_support, nearest_resistance
+
+
 def score_pair(
     pair: str,
     bid: Optional[float],
@@ -188,6 +259,9 @@ def score_pair(
     indicators: dict,
     session: Optional[str] = None,
     max_spread_pips: float = 2.0,
+    h1_direction: Optional[str] = None,
+    h4_direction: Optional[str] = None,
+    sr_levels: Optional[list] = None,
 ) -> dict:
     """
     Compute all signal scores and produce final trade_signal.
@@ -218,14 +292,22 @@ def score_pair(
         close, session_high, session_low, atr14, session
     )
 
-    total = mom_score + rev_score + sess_score
-
-    # Determine dominant direction
+    # Determine dominant direction from base signals
     long_signals = sum(1 for s in (mom_signal, rev_signal, sess_signal) if "LONG" in s)
     short_signals = sum(1 for s in (mom_signal, rev_signal, sess_signal) if "SHORT" in s)
     dominant = "LONG" if long_signals > short_signals else (
         "SHORT" if short_signals > long_signals else "NEUTRAL"
     )
+
+    # MTF confluence bonus (0-30 pts)
+    mtf_bonus, mtf_confluence = _mtf_confluence(dominant, h1_direction, h4_direction)
+
+    # S/R proximity bonus (0-25 pts)
+    sr_bonus, sr_reason, at_key_level, nearest_support, nearest_resistance = _sr_proximity(
+        close, atr14, sr_levels or [], dominant
+    )
+
+    total = mom_score + rev_score + sess_score + mtf_bonus + sr_bonus
 
     # Penalize spread
     if spread_pips is not None and spread_pips > max_spread_pips:
@@ -234,12 +316,12 @@ def score_pair(
     if spread_pips is not None and spread_pips > max_spread_pips * 2:
         trade_signal = "AVOID"
         reason = f"Spread too wide ({spread_pips:.1f} pips)"
-    elif total >= 70 and dominant == "LONG":
+    elif total >= 70 and dominant == "LONG" and mtf_bonus >= 15:
         trade_signal = "STRONG_BUY"
-        reason = f"Strong long setup ({total:.0f}pts)"
-    elif total >= 70 and dominant == "SHORT":
+        reason = f"Strong long setup ({total:.0f}pts, MTF:{mtf_confluence})"
+    elif total >= 70 and dominant == "SHORT" and mtf_bonus >= 15:
         trade_signal = "STRONG_SHORT"
-        reason = f"Strong short setup ({total:.0f}pts)"
+        reason = f"Strong short setup ({total:.0f}pts, MTF:{mtf_confluence})"
     elif total >= 45 and dominant == "LONG":
         trade_signal = "BUY_CANDIDATE"
         reason = f"Long candidate ({total:.0f}pts)"
@@ -260,11 +342,22 @@ def score_pair(
         signal_parts.append(f"Reversion: {rev_reason}")
     if sess_reason:
         signal_parts.append(f"Session: {sess_reason}")
+    if mtf_confluence != "NONE":
+        signal_parts.append(f"MTF: {mtf_confluence} ({h1_direction or '?'}/{h4_direction or '?'})")
+    if sr_reason:
+        signal_parts.append(f"S/R: {sr_reason}")
 
     return {
         "momentum_score": mom_score,
         "reversion_score": rev_score,
         "session_score": sess_score,
+        "mtf_score": mtf_bonus,
+        "mtf_confluence": mtf_confluence,
+        "sr_score": sr_bonus,
+        "at_key_level": at_key_level,
+        "nearest_support": nearest_support,
+        "nearest_resistance": nearest_resistance,
+        "sr_levels_json": json.dumps(sr_levels[:5]) if sr_levels else None,
         "total_score": round(total, 1),
         "trade_signal": trade_signal,
         "signal_reason": reason,

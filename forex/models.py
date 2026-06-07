@@ -56,6 +56,21 @@ class ForexSnapshot(BaseModel):
     signal_reason: str = ""
     risk_notes: str = ""
     as_of: str = ""
+    # Multi-timeframe confluence
+    h1_direction: Optional[str] = None
+    h4_direction: Optional[str] = None
+    mtf_score: float = 0.0
+    mtf_confluence: Optional[str] = None
+    # Support/Resistance
+    nearest_support: Optional[float] = None
+    nearest_resistance: Optional[float] = None
+    sr_score: float = 0.0
+    at_key_level: bool = False
+    sr_levels_json: Optional[str] = None
+    # Currency strength
+    base_strength: Optional[float] = None
+    quote_strength: Optional[float] = None
+    strength_assessment: Optional[str] = None
 
 
 class ScanRequest(BaseModel):

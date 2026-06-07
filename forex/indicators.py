@@ -134,6 +134,98 @@ def calculate_session_hl(
     return max(highs), min(lows)
 
 
+def compute_trend_direction(bars: List[dict]) -> str:
+    """
+    Classify higher-timeframe trend direction (for H1/H4 bars).
+    Returns 'LONG', 'SHORT', or 'NEUTRAL'.
+    Uses 2-vote consensus: EMA9/EMA20 cross + MACD histogram sign.
+    """
+    if len(bars) < 26:
+        return "NEUTRAL"
+    closes = [b["close"] for b in bars]
+    ema9 = calculate_ema(closes, 9)
+    ema20 = calculate_ema(closes, 20)
+    _, _, macd_hist = calculate_macd(closes)
+
+    long_votes = 0
+    short_votes = 0
+    if ema9 is not None and ema20 is not None:
+        if ema9 > ema20:
+            long_votes += 1
+        elif ema9 < ema20:
+            short_votes += 1
+    if macd_hist is not None:
+        if macd_hist > 0:
+            long_votes += 1
+        elif macd_hist < 0:
+            short_votes += 1
+
+    if long_votes > short_votes:
+        return "LONG"
+    elif short_votes > long_votes:
+        return "SHORT"
+    return "NEUTRAL"
+
+
+def detect_sr_levels(bars: List[dict], lookback: int = 50, n_pivot: int = 3) -> List[dict]:
+    """
+    Detect support/resistance levels using pivot high/low method.
+    Returns list of {"price", "type", "touches", "strength"} sorted by strength desc.
+    """
+    if len(bars) < n_pivot * 2 + 1:
+        return []
+    recent = bars[-lookback:] if len(bars) > lookback else bars
+    closes = [b["close"] for b in recent]
+    highs = [b["high"] for b in recent]
+    lows = [b["low"] for b in recent]
+
+    atr = calculate_atr(highs, lows, closes, period=min(14, len(recent) - 1)) or 0.001
+    tolerance = atr * 0.5
+
+    pivot_highs: List[float] = []
+    pivot_lows: List[float] = []
+    n = len(recent)
+    for i in range(n_pivot, n - n_pivot):
+        lh = highs[i - n_pivot:i]
+        rh = highs[i + 1:i + n_pivot + 1]
+        if lh and rh and highs[i] > max(lh) and highs[i] > max(rh):
+            pivot_highs.append(highs[i])
+        ll = lows[i - n_pivot:i]
+        rl = lows[i + 1:i + n_pivot + 1]
+        if ll and rl and lows[i] < min(ll) and lows[i] < min(rl):
+            pivot_lows.append(lows[i])
+
+    def _cluster(prices: List[float], level_type: str) -> List[dict]:
+        if not prices:
+            return []
+        sorted_prices = sorted(prices)
+        clusters: List[List[float]] = [[sorted_prices[0]]]
+        for p in sorted_prices[1:]:
+            if p - clusters[-1][-1] <= tolerance:
+                clusters[-1].append(p)
+            else:
+                clusters.append([p])
+        result = []
+        for cluster in clusters:
+            price = sum(cluster) / len(cluster)
+            touches = sum(
+                1 for b in recent
+                if (level_type == "R" and abs(b["high"] - price) <= tolerance * 2)
+                or (level_type == "S" and abs(b["low"] - price) <= tolerance * 2)
+            )
+            result.append({
+                "price": round(price, 6),
+                "type": level_type,
+                "touches": touches,
+                "strength": float(max(len(cluster), touches)),
+            })
+        return result
+
+    levels = _cluster(pivot_highs, "R") + _cluster(pivot_lows, "S")
+    levels.sort(key=lambda x: x["strength"], reverse=True)
+    return levels[:8]
+
+
 def compute_all(bars: List[ForexBarDict]) -> dict:
     """
     Compute all indicators from a list of bar dicts.

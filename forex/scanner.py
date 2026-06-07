@@ -1,51 +1,16 @@
 from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-from typing import List, Optional, Tuple
+from typing import List
 
 from .config import AppSettings
 from .models import ForexSnapshot, ScanRequest, ScanSummary
 from .oanda import OandaClient
 from .storage import Storage
-from .indicators import compute_all, calculate_session_hl
+from .indicators import compute_all, compute_trend_direction, detect_sr_levels
 from .signals import score_pair
 from .market_sessions import current_session
-
-
-def _fetch_and_analyze(
-    client: OandaClient,
-    pair: str,
-    request: ScanRequest,
-) -> Tuple[Optional[ForexSnapshot], Optional[str]]:
-    """Fetch candles for one pair, compute indicators + signals. Returns (snapshot, error)."""
-    try:
-        bars = client.get_candles(pair, granularity="M5", count=200)
-        if not bars:
-            return None, "No candle data returned"
-
-        bar_dicts = [b.model_dump() for b in bars]
-        indicators = compute_all(bar_dicts)
-        if not indicators:
-            return None, "Indicator computation returned empty"
-
-        # Session high/low: use bars from current session start
-        session = current_session()
-        session_high, session_low = None, None
-        if len(bar_dicts) >= 12:
-            # Approximate session start as ~2 hours back (24 M5 bars = 2h)
-            recent = bar_dicts[-48:]
-            highs = [b["high"] for b in recent]
-            lows = [b["low"] for b in recent]
-            session_high = max(highs)
-            session_low = min(lows)
-
-        indicators["session_high"] = session_high
-        indicators["session_low"] = session_low
-
-        return None, None  # filled below (quote merged later)
-
-    except Exception as exc:
-        return None, str(exc)
+from .strength import calculate_strength, get_strength_for_pair, strength_bonus
 
 
 def run_scan(
@@ -82,6 +47,31 @@ def run_scan(
             indicators["session_high"] = session_high
             indicators["session_low"] = session_low
 
+            # Fetch H1/H4 bars for MTF and S/R analysis (optional — fail gracefully)
+            h1_bar_dicts: List[dict] = []
+            h4_bar_dicts: List[dict] = []
+            try:
+                h1_bars = client.get_candles(pair, granularity="H1", count=100)
+                h1_bar_dicts = [b.model_dump() for b in h1_bars]
+            except Exception:
+                pass
+            try:
+                h4_bars = client.get_candles(pair, granularity="H4", count=60)
+                h4_bar_dicts = [b.model_dump() for b in h4_bars]
+            except Exception:
+                pass
+
+            h1_direction = compute_trend_direction(h1_bar_dicts) if h1_bar_dicts else None
+            h4_direction = compute_trend_direction(h4_bar_dicts) if h4_bar_dicts else None
+
+            # S/R levels from H4 (longer-term structure) + H1 (shorter-term)
+            sr_levels: List[dict] = []
+            if h4_bar_dicts:
+                sr_levels += detect_sr_levels(h4_bar_dicts, lookback=50)
+            if h1_bar_dicts:
+                sr_levels += detect_sr_levels(h1_bar_dicts, lookback=30)
+            sr_levels.sort(key=lambda x: x["strength"], reverse=True)
+
             session = current_session()
             quote = quotes_by_pair.get(pair)
             bid = quote.bid if quote else None
@@ -98,6 +88,9 @@ def run_scan(
                 indicators=indicators,
                 session=session,
                 max_spread_pips=request.max_spread_pips,
+                h1_direction=h1_direction,
+                h4_direction=h4_direction,
+                sr_levels=sr_levels,
             )
 
             snapshot = ForexSnapshot(
@@ -134,6 +127,17 @@ def run_scan(
                 signal_reason=scoring.get("signal_reason", ""),
                 risk_notes=scoring.get("risk_notes", ""),
                 as_of=as_of,
+                # MTF confluence
+                h1_direction=h1_direction,
+                h4_direction=h4_direction,
+                mtf_score=scoring.get("mtf_score", 0.0),
+                mtf_confluence=scoring.get("mtf_confluence"),
+                # Support/Resistance
+                nearest_support=scoring.get("nearest_support"),
+                nearest_resistance=scoring.get("nearest_resistance"),
+                sr_score=scoring.get("sr_score", 0.0),
+                at_key_level=scoring.get("at_key_level", False),
+                sr_levels_json=scoring.get("sr_levels_json"),
             )
             return pair, snapshot, None
 
@@ -155,7 +159,18 @@ def run_scan(
                 if snapshot.trade_signal not in ("AVOID", "WATCH_ONLY"):
                     summary.signals_found += 1
 
-    # Sort by score descending
+    # Post-scan: compute currency strength and adjust scores
+    if snapshots:
+        strength_scores = calculate_strength([s.model_dump() for s in snapshots])
+        for s in snapshots:
+            base_str, quote_str, assessment = get_strength_for_pair(s.pair, strength_scores)
+            s.base_strength = base_str
+            s.quote_strength = quote_str
+            s.strength_assessment = assessment
+            bonus = strength_bonus(assessment, s.trade_signal)
+            s.total_score = round(s.total_score + bonus, 1)
+
+    # Sort by score descending (after strength adjustment)
     snapshots.sort(key=lambda s: s.total_score, reverse=True)
     storage.save_snapshots(scan_id, snapshots)
 

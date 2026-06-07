@@ -13,6 +13,7 @@ from forex.models import ScanRequest
 from forex.pairs import UNIVERSE_MAP, format_pair
 from forex.scanner import run_scan
 from forex.storage import Storage
+from forex.strength import calculate_strength, CURRENCIES
 
 st.set_page_config(
     page_title="Forex Trading Dashboard",
@@ -252,8 +253,8 @@ def _page_scanner(
             except Exception as exc:
                 st.error(f"Scan failed: {exc}")
 
-    tab_results, tab_watchlist, tab_logs, tab_settings = st.tabs(
-        ["Results", "Watchlist", "Scan Logs", "Settings"]
+    tab_results, tab_watchlist, tab_perf, tab_logs, tab_settings = st.tabs(
+        ["Results", "Watchlist", "Performance", "Scan Logs", "Settings"]
     )
 
     # ── Results tab ──────────────────────────────────────────────────────────
@@ -263,6 +264,15 @@ def _page_scanner(
             st.info("No scan results yet. Click 'Run Scan' to start.")
         else:
             df = pd.DataFrame(rows)
+
+            # Currency Strength Meter
+            with st.expander("Currency Strength Meter", expanded=True):
+                strength_scores = calculate_strength(rows)
+                strength_df = pd.DataFrame(
+                    [{"Currency": c, "Strength": strength_scores.get(c, 50.0)} for c in CURRENCIES]
+                ).sort_values("Strength", ascending=False)
+                st.bar_chart(strength_df.set_index("Currency"), height=220)
+                st.caption("Strength normalized 0–100 from pair day_change_pct. Higher = relatively stronger currency.")
 
             # Metrics row
             m1, m2, m3, m4 = st.columns(4)
@@ -274,17 +284,22 @@ def _page_scanner(
             m4.metric("Last Scan", last_ts)
 
             # Filters
-            fc1, fc2 = st.columns(2)
+            fc1, fc2, fc3 = st.columns(3)
             all_pairs = sorted(df["pair"].unique().tolist())
             all_signals = sorted(df["trade_signal"].unique().tolist())
             pair_filter = fc1.multiselect("Filter pairs", all_pairs, default=[])
             signal_filter = fc2.multiselect("Filter signals", all_signals, default=[])
+            mtf_filter = fc3.selectbox("MTF Confluence", ["All", "Full Confluence Only", "Partial+"])
 
             filtered = df.copy()
             if pair_filter:
                 filtered = filtered[filtered["pair"].isin(pair_filter)]
             if signal_filter:
                 filtered = filtered[filtered["trade_signal"].isin(signal_filter)]
+            if mtf_filter == "Full Confluence Only" and "mtf_confluence" in filtered.columns:
+                filtered = filtered[filtered["mtf_confluence"] == "FULL"]
+            elif mtf_filter == "Partial+" and "mtf_confluence" in filtered.columns:
+                filtered = filtered[filtered["mtf_confluence"].isin(["FULL", "PARTIAL"])]
 
             # Apply signal mode filter
             if signal_mode == "Momentum":
@@ -298,6 +313,9 @@ def _page_scanner(
             display_cols = [
                 "pair", "trade_signal", "total_score",
                 "momentum_score", "reversion_score", "session_score",
+                "mtf_score", "mtf_confluence", "h1_direction", "h4_direction",
+                "sr_score", "at_key_level", "nearest_support", "nearest_resistance",
+                "strength_assessment",
                 "bid", "ask", "spread_pips",
                 "close", "day_change_pct",
                 "rsi14", "macd_histogram", "ema9", "ema20",
@@ -308,12 +326,18 @@ def _page_scanner(
             display["pair"] = display["pair"].apply(format_pair)
             display["trade_signal"] = display["trade_signal"].apply(_signal_badge)
 
-            price_cols = {c: "{:.5f}" for c in ["bid", "ask", "close", "ema9", "ema20"] if c in display.columns}
-            st.dataframe(
-                display.style.format(price_cols),
-                use_container_width=True,
-                hide_index=True,
-            )
+            price_cols = {c: "{:.5f}" for c in ["bid", "ask", "close", "ema9", "ema20", "nearest_support", "nearest_resistance"] if c in display.columns}
+
+            def _highlight_key_level(row):
+                if row.get("at_key_level"):
+                    return ["background-color: #2a2a10"] * len(row)
+                return [""] * len(row)
+
+            styled = display.style.format(price_cols)
+            if "at_key_level" in display.columns:
+                styled = styled.apply(_highlight_key_level, axis=1)
+
+            st.dataframe(styled, use_container_width=True, hide_index=True)
 
             # Column guide
             with st.expander("Column Guide"):
@@ -322,10 +346,19 @@ def _page_scanner(
 |--------|-------------|
 | pair | Currency pair (e.g. EUR/USD) |
 | trade_signal | Overall signal: STRONG_BUY, BUY_CANDIDATE, SHORT_CANDIDATE, STRONG_SHORT, WATCH_ONLY, AVOID |
-| total_score | Combined score (0–100) |
+| total_score | Combined score (base 0–100 + MTF 0–30 + S/R 0–25 + strength ±10) |
 | momentum_score | EMA/MACD/RSI momentum component (0–40) |
 | reversion_score | RSI extreme/Bollinger Band component (0–40) |
 | session_score | Session quality/breakout component (0–20) |
+| mtf_score | Multi-timeframe confluence bonus (0=NONE, 15=PARTIAL, 30=FULL) |
+| mtf_confluence | FULL=all 3 TFs agree, PARTIAL=2 agree, NONE=conflict |
+| h1_direction | H1 trend direction (LONG/SHORT/NEUTRAL) |
+| h4_direction | H4 trend direction (LONG/SHORT/NEUTRAL) |
+| sr_score | Support/Resistance proximity bonus (0–25) |
+| at_key_level | Price is AT a key S/R level (highlighted row) |
+| nearest_support | Closest support level below current price |
+| nearest_resistance | Closest resistance level above current price |
+| strength_assessment | Currency strength: STRONG_BASE_WEAK_QUOTE / WEAK_BASE_STRONG_QUOTE / NEUTRAL |
 | spread_pips | Bid-ask spread in pips |
 | rsi14 | RSI(14): <30 oversold, >70 overbought |
 | macd_histogram | MACD histogram (positive = bullish momentum) |
@@ -376,10 +409,16 @@ def _page_scanner(
             wdf["trade_signal"] = wdf["trade_signal"].apply(_signal_badge)
             st.dataframe(wdf, use_container_width=True, hide_index=True)
 
-            close_id = st.number_input("Close watch ID", min_value=0, step=1, value=0)
+            cc1, cc2 = st.columns(2)
+            close_id = cc1.number_input("Close watch ID", min_value=0, step=1, value=0)
+            exit_price = cc2.number_input("Exit price (0 = skip outcome)", min_value=0.0, format="%.5f")
             if st.button("Close Watch") and close_id > 0:
-                storage.close_watchlist(int(close_id))
-                st.success(f"Closed watch ID {close_id}.")
+                if exit_price > 0:
+                    storage.close_watchlist_with_outcome(int(close_id), float(exit_price))
+                    st.success(f"Closed watch ID {close_id} — outcome recorded.")
+                else:
+                    storage.close_watchlist(int(close_id))
+                    st.success(f"Closed watch ID {close_id}.")
                 st.rerun()
 
         with st.expander("Closed Watches"):
@@ -388,6 +427,57 @@ def _page_scanner(
                 cdf = pd.DataFrame(closed)
                 cdf["pair"] = cdf["pair"].apply(format_pair)
                 st.dataframe(cdf, use_container_width=True, hide_index=True)
+
+    # ── Performance tab ───────────────────────────────────────────────────────
+    with tab_perf:
+        outcomes = storage.load_trade_outcomes()
+        if not outcomes:
+            st.info("No trade outcomes yet. Close watchlist entries with an exit price to start tracking performance.")
+        else:
+            odf = pd.DataFrame(outcomes)
+
+            # Overall metrics
+            total_trades = len(odf)
+            wins = (odf["outcome"] == "WIN").sum()
+            win_rate = wins / total_trades if total_trades else 0
+            r_vals = odf["r_multiple"].dropna()
+            avg_r = r_vals.mean() if len(r_vals) else 0.0
+            expectancy = avg_r * win_rate - (1 - win_rate) if len(r_vals) else 0.0
+
+            pm1, pm2, pm3, pm4 = st.columns(4)
+            pm1.metric("Total Trades", total_trades)
+            pm2.metric("Win Rate", f"{win_rate*100:.1f}%")
+            pm3.metric("Avg R:R", f"{avg_r:.2f}R")
+            pm4.metric("Expectancy", f"{expectancy:.3f}R")
+
+            # Equity curve (cumulative R)
+            if "r_multiple" in odf.columns:
+                st.subheader("Equity Curve (Cumulative R)")
+                cum_r = odf.sort_values("created_at")["r_multiple"].fillna(0).cumsum().reset_index(drop=True)
+                st.line_chart(cum_r)
+
+            # Win rate by pair
+            pair_stats = storage.load_performance_by_dimension("pair")
+            if pair_stats:
+                st.subheader("Win Rate by Pair")
+                pair_df = pd.DataFrame(pair_stats)[["dimension_value", "trades", "wins", "win_rate", "avg_r", "expectancy"]]
+                pair_df.columns = ["Pair", "Trades", "Wins", "Win Rate", "Avg R", "Expectancy"]
+                pair_df["Win Rate"] = pair_df["Win Rate"].apply(lambda x: f"{x*100:.1f}%")
+                st.dataframe(pair_df, use_container_width=True, hide_index=True)
+
+            # Win rate by signal type
+            sig_stats = storage.load_performance_by_dimension("signal")
+            if sig_stats:
+                st.subheader("Win Rate by Signal")
+                sig_df = pd.DataFrame(sig_stats)[["dimension_value", "trades", "wins", "win_rate", "avg_r", "expectancy"]]
+                sig_df.columns = ["Signal", "Trades", "Wins", "Win Rate", "Avg R", "Expectancy"]
+                sig_df["Win Rate"] = sig_df["Win Rate"].apply(lambda x: f"{x*100:.1f}%")
+                st.dataframe(sig_df, use_container_width=True, hide_index=True)
+
+            # Recent trade log
+            with st.expander("Trade History"):
+                odf["pair"] = odf["pair"].apply(format_pair)
+                st.dataframe(odf, use_container_width=True, hide_index=True)
 
     # ── Scan Logs tab ─────────────────────────────────────────────────────────
     with tab_logs:

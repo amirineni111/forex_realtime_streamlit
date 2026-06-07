@@ -1,6 +1,7 @@
 from __future__ import annotations
 import json
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
 
@@ -106,7 +107,54 @@ class Storage:
                     created_at   TEXT DEFAULT CURRENT_TIMESTAMP,
                     closed_at    TEXT
                 );
+
+                CREATE TABLE IF NOT EXISTS forex_trade_outcomes (
+                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    watchlist_id INTEGER NOT NULL,
+                    pair         TEXT,
+                    signal       TEXT,
+                    entry_price  REAL,
+                    exit_price   REAL,
+                    exit_pips    REAL,
+                    r_multiple   REAL,
+                    outcome      TEXT,
+                    hold_minutes INTEGER,
+                    created_at   TEXT DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS forex_performance_stats (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    computed_at     TEXT DEFAULT CURRENT_TIMESTAMP,
+                    dimension       TEXT,
+                    dimension_value TEXT,
+                    trades          INTEGER,
+                    wins            INTEGER,
+                    win_rate        REAL,
+                    avg_r           REAL,
+                    expectancy      REAL
+                );
             """)
+        # Migrate existing forex_snapshots with new columns (safe on repeated startup)
+        new_cols = [
+            ("h1_direction", "TEXT"),
+            ("h4_direction", "TEXT"),
+            ("mtf_score", "REAL DEFAULT 0"),
+            ("mtf_confluence", "TEXT"),
+            ("nearest_support", "REAL"),
+            ("nearest_resistance", "REAL"),
+            ("sr_score", "REAL DEFAULT 0"),
+            ("at_key_level", "INTEGER DEFAULT 0"),
+            ("sr_levels_json", "TEXT"),
+            ("base_strength", "REAL"),
+            ("quote_strength", "REAL"),
+            ("strength_assessment", "TEXT"),
+        ]
+        for col, typedef in new_cols:
+            try:
+                with self._connect() as conn:
+                    conn.execute(f"ALTER TABLE forex_snapshots ADD COLUMN {col} {typedef}")
+            except sqlite3.OperationalError:
+                pass  # column already exists
 
     # ── Scan run lifecycle ──────────────────────────────────────────────────
 
@@ -159,6 +207,13 @@ class Storage:
                 s.current_session, s.session_high, s.session_low,
                 s.momentum_score, s.reversion_score, s.session_score, s.total_score,
                 s.trade_signal, s.signal_reason, s.risk_notes, s.as_of,
+                # MTF confluence
+                s.h1_direction, s.h4_direction, s.mtf_score, s.mtf_confluence,
+                # Support/Resistance
+                s.nearest_support, s.nearest_resistance, s.sr_score,
+                int(s.at_key_level), s.sr_levels_json,
+                # Currency strength
+                s.base_strength, s.quote_strength, s.strength_assessment,
             ))
         with self._connect() as conn:
             conn.executemany(
@@ -168,8 +223,12 @@ class Storage:
                 "atr14,bb_upper,bb_middle,bb_lower,bb_width_pct,"
                 "current_session,session_high,session_low,"
                 "momentum_score,reversion_score,session_score,total_score,"
-                "trade_signal,signal_reason,risk_notes,as_of) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "trade_signal,signal_reason,risk_notes,as_of,"
+                "h1_direction,h4_direction,mtf_score,mtf_confluence,"
+                "nearest_support,nearest_resistance,sr_score,at_key_level,sr_levels_json,"
+                "base_strength,quote_strength,strength_assessment) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
+                "?,?,?,?,?,?,?,?,?,?,?,?)",
                 rows,
             )
 
@@ -245,6 +304,100 @@ class Storage:
                 "UPDATE forex_watchlist SET status='closed', closed_at=CURRENT_TIMESTAMP WHERE id=?",
                 (row_id,),
             )
+
+    def close_watchlist_with_outcome(self, row_id: int, exit_price: float) -> None:
+        """Close a watchlist entry, compute P&L, and record the trade outcome."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM forex_watchlist WHERE id=?", (row_id,)
+            ).fetchone()
+        if not row:
+            return
+        row = dict(row)
+
+        pair = row.get("pair", "")
+        signal = row.get("signal") or ""
+        entry_price = row.get("entry_price") or 0.0
+        stop_pips = row.get("stop_pips") or 0.0
+        created_at = row.get("created_at") or ""
+
+        pip_value = 0.01 if "JPY" in pair else 0.0001
+        direction = -1 if signal in ("STRONG_SHORT", "SHORT_CANDIDATE") else 1
+        exit_pips = round((exit_price - entry_price) * direction / pip_value, 1) if entry_price else 0.0
+        r_multiple = round(exit_pips / stop_pips, 2) if stop_pips and stop_pips > 0 else None
+        outcome = "WIN" if exit_pips > 0 else ("LOSS" if exit_pips < 0 else "BREAKEVEN")
+
+        hold_minutes: Optional[int] = None
+        try:
+            created = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+            hold_minutes = int((datetime.now(timezone.utc) - created).total_seconds() / 60)
+        except Exception:
+            pass
+
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO forex_trade_outcomes "
+                "(watchlist_id,pair,signal,entry_price,exit_price,exit_pips,r_multiple,outcome,hold_minutes) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                (row_id, pair, signal, entry_price, exit_price, exit_pips, r_multiple, outcome, hold_minutes),
+            )
+            conn.execute(
+                "UPDATE forex_watchlist SET status='closed', closed_at=CURRENT_TIMESTAMP WHERE id=?",
+                (row_id,),
+            )
+        self.compute_and_save_performance()
+
+    def compute_and_save_performance(self) -> None:
+        """Recompute and save aggregated performance stats from all trade outcomes."""
+        with self._connect() as conn:
+            all_rows = [dict(r) for r in conn.execute("SELECT * FROM forex_trade_outcomes").fetchall()]
+        if not all_rows:
+            return
+
+        def _stats(rows: list) -> Optional[dict]:
+            if not rows:
+                return None
+            wins = sum(1 for r in rows if r["outcome"] == "WIN")
+            n = len(rows)
+            win_rate = round(wins / n, 3)
+            r_vals = [r["r_multiple"] for r in rows if r["r_multiple"] is not None]
+            avg_r = round(sum(r_vals) / len(r_vals), 2) if r_vals else 0.0
+            expectancy = round(avg_r * win_rate - (1 - win_rate), 3) if r_vals else 0.0
+            return {"trades": n, "wins": wins, "win_rate": win_rate, "avg_r": avg_r, "expectancy": expectancy}
+
+        insert_rows = []
+        for dimension, key in [("pair", "pair"), ("signal", "signal")]:
+            for value in set(r[key] for r in all_rows if r.get(key)):
+                subset = [r for r in all_rows if r.get(key) == value]
+                s = _stats(subset)
+                if s:
+                    insert_rows.append((dimension, value, s["trades"], s["wins"], s["win_rate"], s["avg_r"], s["expectancy"]))
+        s = _stats(all_rows)
+        if s:
+            insert_rows.append(("overall", "all", s["trades"], s["wins"], s["win_rate"], s["avg_r"], s["expectancy"]))
+
+        with self._connect() as conn:
+            conn.execute("DELETE FROM forex_performance_stats")
+            conn.executemany(
+                "INSERT INTO forex_performance_stats "
+                "(dimension,dimension_value,trades,wins,win_rate,avg_r,expectancy) VALUES (?,?,?,?,?,?,?)",
+                insert_rows,
+            )
+
+    def load_trade_outcomes(self, limit: int = 200) -> list:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM forex_trade_outcomes ORDER BY created_at DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def load_performance_by_dimension(self, dimension: str) -> list:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM forex_performance_stats WHERE dimension=? ORDER BY win_rate DESC",
+                (dimension,),
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     def load_watchlist(self, status: str = "watching") -> list:
         with self._connect() as conn:
