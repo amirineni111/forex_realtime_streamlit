@@ -11,7 +11,7 @@ _SESSION_WINDOWS = {
     "London_NY_Overlap": (time(8, 0), time(12, 0)),
 }
 
-_ASIAN_START = time(19, 0)
+_ASIAN_START = time(17, 0)  # Sydney opens ~5pm ET (forex convention)
 _ASIAN_END = time(4, 0)
 
 

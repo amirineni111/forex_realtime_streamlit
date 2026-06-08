@@ -326,14 +326,20 @@ def _page_scanner(
             display["pair"] = display["pair"].apply(format_pair)
             display["trade_signal"] = display["trade_signal"].apply(_signal_badge)
 
-            price_cols = {c: "{:.5f}" for c in ["bid", "ask", "close", "ema9", "ema20", "nearest_support", "nearest_resistance"] if c in display.columns}
+            def _fmt5(x):
+                try:
+                    return f"{x:.5f}" if x is not None and x == x else ""
+                except (TypeError, ValueError):
+                    return ""
+
+            price_cols = {c: _fmt5 for c in ["bid", "ask", "close", "ema9", "ema20", "nearest_support", "nearest_resistance"] if c in display.columns}
 
             def _highlight_key_level(row):
                 if row.get("at_key_level"):
                     return ["background-color: #2a2a10"] * len(row)
                 return [""] * len(row)
 
-            styled = display.style.format(price_cols)
+            styled = display.style.format(price_cols, na_rep="")
             if "at_key_level" in display.columns:
                 styled = styled.apply(_highlight_key_level, axis=1)
 
@@ -406,7 +412,8 @@ def _page_scanner(
         else:
             wdf = pd.DataFrame(watching)
             wdf["pair"] = wdf["pair"].apply(format_pair)
-            wdf["trade_signal"] = wdf["trade_signal"].apply(_signal_badge)
+            if "signal" in wdf.columns:
+                wdf["signal"] = wdf["signal"].apply(lambda s: _signal_badge(s) if s else s)
             st.dataframe(wdf, use_container_width=True, hide_index=True)
 
             cc1, cc2 = st.columns(2)
