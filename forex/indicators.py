@@ -1,4 +1,5 @@
 from __future__ import annotations
+from datetime import datetime, timezone
 from typing import List, Optional, Tuple
 
 
@@ -96,6 +97,97 @@ def calculate_atr(
     for tr in trs[period:]:
         atr = (atr * (period - 1) + tr) / period
     return round(atr, 6)
+
+
+def calculate_adx(
+    highs: List[float],
+    lows: List[float],
+    closes: List[float],
+    period: int = 14,
+) -> Optional[float]:
+    """
+    Wilder's ADX (trend-strength). Returns a value ~0-100 or None if insufficient bars.
+    Rule of thumb: >25 trending, <18 ranging. Used to choose momentum vs reversion.
+    """
+    n = len(closes)
+    if n < period * 2 + 1:
+        return None
+
+    plus_dm: List[float] = []
+    minus_dm: List[float] = []
+    trs: List[float] = []
+    for i in range(1, n):
+        up = highs[i] - highs[i - 1]
+        down = lows[i - 1] - lows[i]
+        plus_dm.append(up if (up > down and up > 0) else 0.0)
+        minus_dm.append(down if (down > up and down > 0) else 0.0)
+        trs.append(
+            max(
+                highs[i] - lows[i],
+                abs(highs[i] - closes[i - 1]),
+                abs(lows[i] - closes[i - 1]),
+            )
+        )
+    if len(trs) < period:
+        return None
+
+    # Wilder-smoothed running sums seeded with the first `period` values
+    atr = sum(trs[:period])
+    pdm = sum(plus_dm[:period])
+    mdm = sum(minus_dm[:period])
+    dxs: List[float] = []
+    for i in range(period, len(trs)):
+        atr = atr - atr / period + trs[i]
+        pdm = pdm - pdm / period + plus_dm[i]
+        mdm = mdm - mdm / period + minus_dm[i]
+        if atr == 0:
+            continue
+        pdi = 100 * pdm / atr
+        mdi = 100 * mdm / atr
+        denom = pdi + mdi
+        dx = 100 * abs(pdi - mdi) / denom if denom else 0.0
+        dxs.append(dx)
+
+    if not dxs:
+        return None
+    if len(dxs) < period:
+        return round(sum(dxs) / len(dxs), 1)
+    adx = sum(dxs[:period]) / period
+    for dx in dxs[period:]:
+        adx = (adx * (period - 1) + dx) / period
+    return round(adx, 1)
+
+
+def _parse_oanda_ts(ts: str) -> Optional[datetime]:
+    """Parse OANDA RFC3339 timestamps (which carry 9-digit nanosecond fractions)."""
+    if not ts:
+        return None
+    try:
+        if "." in ts:
+            head, frac = ts.split(".", 1)
+            frac = frac.rstrip("Z")[:6]  # fromisoformat handles <= microseconds
+            iso = f"{head}.{frac}+00:00"
+        else:
+            iso = ts.replace("Z", "+00:00")
+        return datetime.fromisoformat(iso)
+    except (ValueError, TypeError):
+        return None
+
+
+def session_high_low(
+    bars: List[dict],
+    start_dt: Optional[datetime],
+) -> Tuple[Optional[float], Optional[float]]:
+    """High/low of all bars whose timestamp is at or after ``start_dt`` (a tz-aware UTC datetime)."""
+    if start_dt is None:
+        return None, None
+    selected = [
+        b for b in bars
+        if (ts := _parse_oanda_ts(b.get("timestamp", ""))) is not None and ts >= start_dt
+    ]
+    if not selected:
+        return None, None
+    return max(b["high"] for b in selected), min(b["low"] for b in selected)
 
 
 def calculate_bollinger_bands(
@@ -243,6 +335,7 @@ def compute_all(bars: List[ForexBarDict]) -> dict:
     ema50 = calculate_ema(closes, 50)
     macd, macd_sig, macd_hist = calculate_macd(closes)
     atr = calculate_atr(highs, lows, closes)
+    adx = calculate_adx(highs, lows, closes)
     bb_upper, bb_mid, bb_lower, bb_width = calculate_bollinger_bands(closes)
 
     last = bars[-1]
@@ -267,6 +360,7 @@ def compute_all(bars: List[ForexBarDict]) -> dict:
         "macd_signal": macd_sig,
         "macd_histogram": macd_hist,
         "atr14": atr,
+        "adx14": adx,
         "bb_upper": bb_upper,
         "bb_middle": bb_mid,
         "bb_lower": bb_lower,

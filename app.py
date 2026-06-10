@@ -272,7 +272,7 @@ def _page_scanner(
                     [{"Currency": c, "Strength": strength_scores.get(c, 50.0)} for c in CURRENCIES]
                 ).sort_values("Strength", ascending=False)
                 st.bar_chart(strength_df.set_index("Currency"), height=220)
-                st.caption("Strength normalized 0–100 from pair day_change_pct. Higher = relatively stronger currency.")
+                st.caption("Strength normalized 0–100 from each pair's ~24h change. Higher = relatively stronger currency.")
 
             # Metrics row
             m1, m2, m3, m4 = st.columns(4)
@@ -311,14 +311,16 @@ def _page_scanner(
 
             # Format display columns
             display_cols = [
-                "pair", "trade_signal", "total_score",
+                "pair", "trade_signal", "total_score", "regime",
                 "momentum_score", "reversion_score", "session_score",
                 "mtf_score", "mtf_confluence", "h1_direction", "h4_direction",
                 "sr_score", "at_key_level", "nearest_support", "nearest_resistance",
                 "strength_assessment",
+                "suggested_entry", "suggested_stop", "suggested_target",
+                "stop_pips", "target_pips", "rr_ratio",
                 "bid", "ask", "spread_pips",
                 "close", "day_change_pct",
-                "rsi14", "macd_histogram", "ema9", "ema20",
+                "rsi14", "adx14", "macd_histogram", "ema9", "ema20",
                 "atr14", "bb_width_pct",
                 "current_session", "signal_reason", "as_of",
             ]
@@ -332,7 +334,11 @@ def _page_scanner(
                 except (TypeError, ValueError):
                     return ""
 
-            price_cols = {c: _fmt5 for c in ["bid", "ask", "close", "ema9", "ema20", "nearest_support", "nearest_resistance"] if c in display.columns}
+            price_cols = {c: _fmt5 for c in [
+                "bid", "ask", "close", "ema9", "ema20",
+                "nearest_support", "nearest_resistance",
+                "suggested_entry", "suggested_stop", "suggested_target",
+            ] if c in display.columns}
 
             def _highlight_key_level(row):
                 if row.get("at_key_level"):
@@ -353,9 +359,13 @@ def _page_scanner(
 | pair | Currency pair (e.g. EUR/USD) |
 | trade_signal | Overall signal: STRONG_BUY, BUY_CANDIDATE, SHORT_CANDIDATE, STRONG_SHORT, WATCH_ONLY, AVOID |
 | total_score | Combined score (base 0–100 + MTF 0–30 + S/R 0–25 + strength ±10) |
-| momentum_score | EMA/MACD/RSI momentum component (0–40) |
-| reversion_score | RSI extreme/Bollinger Band component (0–40) |
+| regime | ADX-based: TREND (momentum weighted), RANGE (reversion weighted), MIXED, UNKNOWN |
+| momentum_score | EMA/MACD/RSI momentum component (0–40), weighted by regime |
+| reversion_score | RSI extreme/Bollinger Band component (0–40), weighted by regime |
 | session_score | Session quality/breakout component (0–20) |
+| suggested_entry / stop / target | ATR-based levels (stop 1.0×ATR, target 1.5×ATR) |
+| stop_pips / target_pips / rr_ratio | Risk in pips, reward in pips, reward:risk (1.5) |
+| adx14 | Trend strength: >25 trending, <18 ranging |
 | mtf_score | Multi-timeframe confluence bonus (0=NONE, 15=PARTIAL, 30=FULL) |
 | mtf_confluence | FULL=all 3 TFs agree, PARTIAL=2 agree, NONE=conflict |
 | h1_direction | H1 trend direction (LONG/SHORT/NEUTRAL) |
@@ -439,7 +449,11 @@ def _page_scanner(
     with tab_perf:
         outcomes = storage.load_trade_outcomes()
         if not outcomes:
-            st.info("No trade outcomes yet. Close watchlist entries with an exit price to start tracking performance.")
+            st.info(
+                "No trade outcomes yet. Outcomes accrue automatically as each scan forward-tests "
+                "actionable signals against their ATR stop/target — or close watchlist entries with "
+                "an exit price to log manual trades."
+            )
         else:
             odf = pd.DataFrame(outcomes)
 
@@ -485,6 +499,19 @@ def _page_scanner(
             with st.expander("Trade History"):
                 odf["pair"] = odf["pair"].apply(format_pair)
                 st.dataframe(odf, use_container_width=True, hide_index=True)
+
+        # Open auto-tracked signals (forward-testing in progress)
+        open_tracked = storage.load_tracked_signals("open")
+        if open_tracked:
+            with st.expander(f"Open Tracked Signals ({len(open_tracked)})"):
+                tdf = pd.DataFrame(open_tracked)
+                tdf["pair"] = tdf["pair"].apply(format_pair)
+                keep = [c for c in [
+                    "pair", "signal", "entry_price", "stop_price", "target_price",
+                    "stop_pips", "target_pips", "entry_ts", "created_at",
+                ] if c in tdf.columns]
+                st.dataframe(tdf[keep], use_container_width=True, hide_index=True)
+                st.caption("Each scan checks these against their ATR stop/target; a touch records a WIN/LOSS outcome.")
 
     # ── Scan Logs tab ─────────────────────────────────────────────────────────
     with tab_logs:

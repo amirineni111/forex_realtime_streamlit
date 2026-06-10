@@ -41,6 +41,7 @@ class ForexSnapshot(BaseModel):
     macd_signal: Optional[float] = None
     macd_histogram: Optional[float] = None
     atr14: Optional[float] = None
+    adx14: Optional[float] = None
     bb_upper: Optional[float] = None
     bb_middle: Optional[float] = None
     bb_lower: Optional[float] = None
@@ -51,11 +52,19 @@ class ForexSnapshot(BaseModel):
     momentum_score: float = 0.0
     reversion_score: float = 0.0
     session_score: float = 0.0
+    regime: Optional[str] = None
     total_score: float = 0.0
     trade_signal: str = "AVOID"
     signal_reason: str = ""
     risk_notes: str = ""
     as_of: str = ""
+    # Suggested trade levels (ATR-based)
+    suggested_entry: Optional[float] = None
+    suggested_stop: Optional[float] = None
+    suggested_target: Optional[float] = None
+    stop_pips: Optional[float] = None
+    target_pips: Optional[float] = None
+    rr_ratio: Optional[float] = None
     # Multi-timeframe confluence
     h1_direction: Optional[str] = None
     h4_direction: Optional[str] = None

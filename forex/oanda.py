@@ -84,6 +84,10 @@ class OandaClient:
         )
         bars: List[ForexBar] = []
         for candle in data.get("candles", []):
+            # Skip the still-forming bar — including it makes every indicator
+            # (RSI/MACD/EMA/breakout) repaint until the candle closes.
+            if not candle.get("complete", False):
+                continue
             mid = candle.get("mid")
             if mid is None:
                 continue

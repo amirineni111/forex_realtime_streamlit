@@ -1,4 +1,5 @@
-from datetime import datetime, time, timezone
+from datetime import datetime, time, timedelta, timezone
+from typing import Optional
 from zoneinfo import ZoneInfo
 
 US_EASTERN = ZoneInfo("America/New_York")
@@ -51,6 +52,32 @@ def current_session(now: datetime = None) -> str:
         return "Asian"
 
     return "Off_Hours"
+
+
+def current_session_start_utc(now: datetime = None) -> Optional[datetime]:
+    """
+    UTC datetime of the active session's open, for keying session high/low.
+    Returns None during Off_Hours (no meaningful session range to break).
+    """
+    session = current_session(now)
+    local = _now_eastern(now)
+
+    if session in ("London", "London_NY_Overlap"):
+        start_t = _SESSION_WINDOWS["London"][0]      # London open 03:00 ET
+    elif session == "New_York":
+        start_t = _SESSION_WINDOWS["New_York"][0]    # 08:00 ET
+    elif session == "Asian":
+        start_t = _ASIAN_START                       # 17:00 ET
+    else:
+        return None
+
+    anchor = local.replace(
+        hour=start_t.hour, minute=start_t.minute, second=0, microsecond=0
+    )
+    # Asian spans midnight: if we're in the early-morning tail, it opened yesterday evening.
+    if session == "Asian" and local.time() <= _ASIAN_END:
+        anchor -= timedelta(days=1)
+    return anchor.astimezone(timezone.utc)
 
 
 def is_forex_market_open(now: datetime = None) -> bool:

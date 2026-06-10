@@ -5,12 +5,24 @@ from typing import List, Optional, Tuple
 from .market_sessions import current_session
 
 
+def _macd_magnitude_pts(macd_histogram: float, atr14: Optional[float], macd: Optional[float]) -> float:
+    """
+    Convert MACD-histogram size into 0-15 pts. Normalizes against ATR (both in price
+    units, so the ratio is unitless): a histogram ~0.3×ATR is treated as full strength.
+    Falls back to the legacy hist/macd ratio when ATR is unavailable.
+    """
+    if atr14 and atr14 > 0:
+        return min(15.0, 50.0 * abs(macd_histogram) / atr14)
+    return min(15.0, 15 * abs(macd_histogram) / max(abs(macd or 0.0), 0.00001))
+
+
 def _momentum(
     ema9: Optional[float],
     ema20: Optional[float],
     macd_histogram: Optional[float],
     macd: Optional[float],
     rsi14: Optional[float],
+    atr14: Optional[float] = None,
 ) -> Tuple[float, str, str]:
     """Score momentum signal (max 40 pts). Returns (score, direction, reason)."""
     score = 0.0
@@ -28,14 +40,14 @@ def _momentum(
             direction = "SHORT"
             reasons.append("EMA9<EMA20 bearish")
 
-    # MACD histogram direction + zero-cross strength (max 15 pts)
+    # MACD histogram direction + ATR-normalized strength (max 15 pts)
     if macd_histogram is not None and macd is not None:
         if macd_histogram > 0 and macd > 0:
-            pts = min(15, 15 * abs(macd_histogram) / max(abs(macd), 0.00001))
+            pts = _macd_magnitude_pts(macd_histogram, atr14, macd)
             score += pts
             reasons.append(f"MACD bullish (+{pts:.0f}pts)")
         elif macd_histogram < 0 and macd < 0:
-            pts = min(15, 15 * abs(macd_histogram) / max(abs(macd), 0.00001))
+            pts = _macd_magnitude_pts(macd_histogram, atr14, macd)
             score += pts
             reasons.append(f"MACD bearish (+{pts:.0f}pts)")
         elif macd_histogram > 0:  # histogram positive but MACD crossing zero
@@ -251,6 +263,59 @@ def _sr_proximity(
     return round(min(score, 25), 1), "; ".join(reasons), at_key_level, nearest_support, nearest_resistance
 
 
+# Regime thresholds on ADX: above TREND → momentum playbook, below RANGE → reversion.
+_ADX_TREND = 25.0
+_ADX_RANGE = 18.0
+
+# ATR multiples for suggested stop/target.
+_STOP_ATR_MULT = 1.0
+_TARGET_ATR_MULT = 1.5
+
+
+def _regime_weights(adx14: Optional[float]) -> Tuple[float, float, str]:
+    """
+    Decide how much to trust momentum vs mean-reversion given trend strength.
+    Returns (momentum_weight, reversion_weight, regime_label). Blends linearly
+    between the range/trend thresholds to avoid hard flip-flopping.
+    """
+    if adx14 is None:
+        return 1.0, 1.0, "UNKNOWN"
+    if adx14 >= _ADX_TREND:
+        return 1.0, 0.0, "TREND"
+    if adx14 <= _ADX_RANGE:
+        return 0.0, 1.0, "RANGE"
+    t = (adx14 - _ADX_RANGE) / (_ADX_TREND - _ADX_RANGE)
+    return round(t, 3), round(1 - t, 3), "MIXED"
+
+
+def _trade_levels(
+    direction: str,
+    entry: Optional[float],
+    atr14: Optional[float],
+    pair: str,
+) -> dict:
+    """ATR-based stop/target/RR for an actionable direction. Empty dict if not computable."""
+    if direction not in ("LONG", "SHORT") or not entry or not atr14 or atr14 <= 0:
+        return {}
+    pip = 0.01 if "JPY" in pair else 0.0001
+    stop_dist = _STOP_ATR_MULT * atr14
+    tgt_dist = _TARGET_ATR_MULT * atr14
+    if direction == "LONG":
+        stop = entry - stop_dist
+        target = entry + tgt_dist
+    else:
+        stop = entry + stop_dist
+        target = entry - tgt_dist
+    return {
+        "suggested_entry": round(entry, 6),
+        "suggested_stop": round(stop, 6),
+        "suggested_target": round(target, 6),
+        "stop_pips": round(stop_dist / pip, 1),
+        "target_pips": round(tgt_dist / pip, 1),
+        "rr_ratio": round(_TARGET_ATR_MULT / _STOP_ATR_MULT, 2),
+    }
+
+
 def score_pair(
     pair: str,
     bid: Optional[float],
@@ -274,6 +339,7 @@ def score_pair(
     macd = indicators.get("macd")
     macd_hist = indicators.get("macd_histogram")
     atr14 = indicators.get("atr14")
+    adx14 = indicators.get("adx14")
     bb_upper = indicators.get("bb_upper")
     bb_lower = indicators.get("bb_lower")
     bb_middle = indicators.get("bb_middle")
@@ -284,19 +350,29 @@ def score_pair(
     if spread_pips is not None and spread_pips > max_spread_pips:
         risk_notes.append(f"Wide spread {spread_pips:.1f} pips (max {max_spread_pips})")
 
-    mom_score, mom_signal, mom_reason = _momentum(ema9, ema20, macd_hist, macd, rsi14)
-    rev_score, rev_signal, rev_reason = _mean_reversion(
+    mom_raw, mom_signal, mom_reason = _momentum(ema9, ema20, macd_hist, macd, rsi14, atr14)
+    rev_raw, rev_signal, rev_reason = _mean_reversion(
         rsi14, close, bb_upper, bb_lower, bb_middle, session_high, session_low
     )
     sess_score, sess_signal, sess_reason = _session_breakout(
         close, session_high, session_low, atr14, session
     )
 
-    # Determine dominant direction from base signals
-    long_signals = sum(1 for s in (mom_signal, rev_signal, sess_signal) if "LONG" in s)
-    short_signals = sum(1 for s in (mom_signal, rev_signal, sess_signal) if "SHORT" in s)
-    dominant = "LONG" if long_signals > short_signals else (
-        "SHORT" if short_signals > long_signals else "NEUTRAL"
+    # Regime gate: in trends trust momentum, in ranges trust reversion. These are
+    # opposite playbooks — weighting (instead of summing both) stops them cancelling.
+    w_mom, w_rev, regime = _regime_weights(adx14)
+    mom_score = round(mom_raw * w_mom, 1)
+    rev_score = round(rev_raw * w_rev, 1)
+
+    # Weighted dominant direction — a suppressed playbook gets no vote.
+    long_w = sum(sc for sig, sc in (
+        (mom_signal, mom_score), (rev_signal, rev_score), (sess_signal, sess_score)
+    ) if "LONG" in sig)
+    short_w = sum(sc for sig, sc in (
+        (mom_signal, mom_score), (rev_signal, rev_score), (sess_signal, sess_score)
+    ) if "SHORT" in sig)
+    dominant = "LONG" if long_w > short_w else (
+        "SHORT" if short_w > long_w else "NEUTRAL"
     )
 
     # MTF confluence bonus (0-30 pts)
@@ -335,6 +411,16 @@ def score_pair(
         trade_signal = "AVOID"
         reason = f"No clear setup ({total:.0f}pts)"
 
+    # ATR-based stop/target/RR for actionable directions
+    entry = round((bid + ask) / 2, 6) if bid and ask else close
+    levels = _trade_levels(dominant, entry, atr14, pair) if trade_signal not in (
+        "AVOID", "WATCH_ONLY"
+    ) else {}
+    if levels and spread_pips is not None and levels["target_pips"] < spread_pips * 3:
+        risk_notes.append(
+            f"Target {levels['target_pips']:.1f}p < 3× spread — thin edge"
+        )
+
     signal_parts = []
     if mom_reason:
         signal_parts.append(f"Momentum: {mom_reason}")
@@ -351,6 +437,14 @@ def score_pair(
         "momentum_score": mom_score,
         "reversion_score": rev_score,
         "session_score": sess_score,
+        "adx14": adx14,
+        "regime": regime,
+        "suggested_entry": levels.get("suggested_entry"),
+        "suggested_stop": levels.get("suggested_stop"),
+        "suggested_target": levels.get("suggested_target"),
+        "stop_pips": levels.get("stop_pips"),
+        "target_pips": levels.get("target_pips"),
+        "rr_ratio": levels.get("rr_ratio"),
         "mtf_score": mtf_bonus,
         "mtf_confluence": mtf_confluence,
         "sr_score": sr_bonus,

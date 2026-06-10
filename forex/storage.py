@@ -122,6 +122,22 @@ class Storage:
                     created_at   TEXT DEFAULT CURRENT_TIMESTAMP
                 );
 
+                CREATE TABLE IF NOT EXISTS forex_signal_tracking (
+                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    pair         TEXT NOT NULL,
+                    signal       TEXT,
+                    direction    INTEGER,
+                    entry_price  REAL,
+                    stop_price   REAL,
+                    target_price REAL,
+                    stop_pips    REAL,
+                    target_pips  REAL,
+                    atr14        REAL,
+                    entry_ts     TEXT,
+                    status       TEXT DEFAULT 'open',
+                    created_at   TEXT DEFAULT CURRENT_TIMESTAMP
+                );
+
                 CREATE TABLE IF NOT EXISTS forex_performance_stats (
                     id              INTEGER PRIMARY KEY AUTOINCREMENT,
                     computed_at     TEXT DEFAULT CURRENT_TIMESTAMP,
@@ -148,6 +164,14 @@ class Storage:
             ("base_strength", "REAL"),
             ("quote_strength", "REAL"),
             ("strength_assessment", "TEXT"),
+            ("adx14", "REAL"),
+            ("regime", "TEXT"),
+            ("suggested_entry", "REAL"),
+            ("suggested_stop", "REAL"),
+            ("suggested_target", "REAL"),
+            ("stop_pips", "REAL"),
+            ("target_pips", "REAL"),
+            ("rr_ratio", "REAL"),
         ]
         for col, typedef in new_cols:
             try:
@@ -214,6 +238,10 @@ class Storage:
                 int(s.at_key_level), s.sr_levels_json,
                 # Currency strength
                 s.base_strength, s.quote_strength, s.strength_assessment,
+                # Regime + suggested trade levels
+                s.adx14, s.regime,
+                s.suggested_entry, s.suggested_stop, s.suggested_target,
+                s.stop_pips, s.target_pips, s.rr_ratio,
             ))
         with self._connect() as conn:
             conn.executemany(
@@ -226,9 +254,11 @@ class Storage:
                 "trade_signal,signal_reason,risk_notes,as_of,"
                 "h1_direction,h4_direction,mtf_score,mtf_confluence,"
                 "nearest_support,nearest_resistance,sr_score,at_key_level,sr_levels_json,"
-                "base_strength,quote_strength,strength_assessment) "
+                "base_strength,quote_strength,strength_assessment,"
+                "adx14,regime,suggested_entry,suggested_stop,suggested_target,"
+                "stop_pips,target_pips,rr_ratio) "
                 "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
-                "?,?,?,?,?,?,?,?,?,?,?,?)",
+                "?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 rows,
             )
 
@@ -404,5 +434,135 @@ class Storage:
             rows = conn.execute(
                 "SELECT * FROM forex_watchlist WHERE status=? ORDER BY created_at DESC",
                 (status,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ── Automatic signal tracking / calibration ─────────────────────────────
+
+    def record_tracked_signal(
+        self, pair: str, signal: str, direction: int,
+        entry: float, stop: float, target: float,
+        stop_pips: float, target_pips: float, atr14: float, entry_ts: str,
+    ) -> None:
+        """
+        Record an actionable signal for hands-off forward evaluation. Skips if an
+        open signal already exists for this pair+direction (avoids re-arming every scan).
+        """
+        with self._connect() as conn:
+            existing = conn.execute(
+                "SELECT 1 FROM forex_signal_tracking "
+                "WHERE pair=? AND direction=? AND status='open' LIMIT 1",
+                (pair, direction),
+            ).fetchone()
+            if existing:
+                return
+            conn.execute(
+                "INSERT INTO forex_signal_tracking "
+                "(pair,signal,direction,entry_price,stop_price,target_price,"
+                "stop_pips,target_pips,atr14,entry_ts) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (pair, signal, direction, entry, stop, target,
+                 stop_pips, target_pips, atr14, entry_ts),
+            )
+
+    def evaluate_tracked_signals(
+        self, pair: str, bars: List[dict], max_hold_hours: float = 8.0,
+    ) -> int:
+        """
+        Resolve open tracked signals for ``pair`` against forward M5 bars: a stop or
+        target touch closes the trade; otherwise it times out at the last close after
+        ``max_hold_hours``. Resolved trades feed forex_trade_outcomes (the same table the
+        Performance tab reads), so win-rate-by-signal calibrates itself over time.
+        Returns the number of signals resolved.
+        """
+        with self._connect() as conn:
+            open_rows = [dict(r) for r in conn.execute(
+                "SELECT * FROM forex_signal_tracking WHERE pair=? AND status='open'", (pair,)
+            ).fetchall()]
+        if not open_rows:
+            return 0
+
+        now = datetime.now(timezone.utc)
+        pip_value = 0.01 if "JPY" in pair else 0.0001
+        resolved = 0
+
+        for row in open_rows:
+            entry_ts = row.get("entry_ts") or ""
+            direction = row.get("direction") or 1
+            entry_price = row.get("entry_price") or 0.0
+            stop = row.get("stop_price") or 0.0
+            target = row.get("target_price") or 0.0
+            stop_pips = row.get("stop_pips") or 0.0
+
+            # Forward bars only (OANDA timestamps share a format → string order is valid)
+            forward = [b for b in bars if b.get("timestamp", "") > entry_ts]
+
+            exit_price: Optional[float] = None
+            outcome: Optional[str] = None
+            for b in forward:
+                hi, lo = b["high"], b["low"]
+                if direction == 1:
+                    if lo <= stop:        # stop checked first = conservative
+                        exit_price, outcome = stop, "LOSS"
+                        break
+                    if hi >= target:
+                        exit_price, outcome = target, "WIN"
+                        break
+                else:
+                    if hi >= stop:
+                        exit_price, outcome = stop, "LOSS"
+                        break
+                    if lo <= target:
+                        exit_price, outcome = target, "WIN"
+                        break
+
+            if outcome is None:
+                # Timeout: close at last available close once held longer than max_hold
+                created = self._parse_dt(row.get("created_at"))
+                aged_out = created is not None and (now - created).total_seconds() > max_hold_hours * 3600
+                if aged_out and forward:
+                    exit_price = forward[-1]["close"]
+                    pnl = (exit_price - entry_price) * direction
+                    outcome = "WIN" if pnl > 0 else ("LOSS" if pnl < 0 else "BREAKEVEN")
+                else:
+                    continue  # still live
+
+            exit_pips = round((exit_price - entry_price) * direction / pip_value, 1) if entry_price else 0.0
+            r_multiple = round(exit_pips / stop_pips, 2) if stop_pips and stop_pips > 0 else None
+            created = self._parse_dt(row.get("created_at"))
+            hold_minutes = int((now - created).total_seconds() / 60) if created else None
+
+            with self._connect() as conn:
+                conn.execute(
+                    "INSERT INTO forex_trade_outcomes "
+                    "(watchlist_id,pair,signal,entry_price,exit_price,exit_pips,"
+                    "r_multiple,outcome,hold_minutes) VALUES (0,?,?,?,?,?,?,?,?)",
+                    (pair, row.get("signal"), entry_price, exit_price, exit_pips,
+                     r_multiple, outcome, hold_minutes),
+                )
+                conn.execute(
+                    "UPDATE forex_signal_tracking SET status='closed' WHERE id=?",
+                    (row["id"],),
+                )
+            resolved += 1
+
+        if resolved:
+            self.compute_and_save_performance()
+        return resolved
+
+    @staticmethod
+    def _parse_dt(value: Optional[str]) -> Optional[datetime]:
+        if not value:
+            return None
+        try:
+            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            return None
+
+    def load_tracked_signals(self, status: str = "open", limit: int = 200) -> list:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM forex_signal_tracking WHERE status=? "
+                "ORDER BY created_at DESC LIMIT ?", (status, limit),
             ).fetchall()
         return [dict(r) for r in rows]
