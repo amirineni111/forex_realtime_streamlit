@@ -342,7 +342,7 @@ def _page_scanner(
 
             def _highlight_key_level(row):
                 if row.get("at_key_level"):
-                    return ["background-color: #2a2a10"] * len(row)
+                    return ["background-color: #fff3b0; color: #000000"] * len(row)
                 return [""] * len(row)
 
             styled = display.style.format(price_cols, na_rep="")
@@ -586,9 +586,9 @@ def _page_live_quotes(settings: AppSettings, storage: Storage, selected_pairs: l
 
         def _row_color(row):
             if session == "London_NY_Overlap":
-                return ["background-color: #1a3a1a"] * len(row)
+                return ["background-color: #d8f3d8; color: #000000"] * len(row)
             elif session in ("London", "New_York"):
-                return ["background-color: #1a2a3a"] * len(row)
+                return ["background-color: #d8e8f3; color: #000000"] * len(row)
             return [""] * len(row)
 
         display_cols = ["pair", "bid", "ask", "mid", "spread_pips", "as_of"]
