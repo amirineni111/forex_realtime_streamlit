@@ -267,9 +267,14 @@ def _sr_proximity(
 _ADX_TREND = 25.0
 _ADX_RANGE = 18.0
 
-# ATR multiples for suggested stop/target.
-_STOP_ATR_MULT = 1.0
-_TARGET_ATR_MULT = 1.5
+# ATR multiples for suggested stop/target. Reward:risk stays fixed — the target is
+# derived from the final stop distance, so widening the stop widens the target too.
+_STOP_ATR_MULT = 1.5
+_RR = 1.5
+# Noise floor for the stop: 1×ATR on M5 is often just 2-4 pips, which sits inside
+# ordinary spread noise and gets tagged within minutes. Never risk less than this.
+_MIN_STOP_PIPS = 8.0
+_SPREAD_STOP_MULT = 4.0  # stop must also be ≥ 4× the current spread
 
 
 def _regime_weights(adx14: Optional[float]) -> Tuple[float, float, str]:
@@ -293,13 +298,18 @@ def _trade_levels(
     entry: Optional[float],
     atr14: Optional[float],
     pair: str,
+    spread_pips: Optional[float] = None,
 ) -> dict:
     """ATR-based stop/target/RR for an actionable direction. Empty dict if not computable."""
     if direction not in ("LONG", "SHORT") or not entry or not atr14 or atr14 <= 0:
         return {}
     pip = 0.01 if "JPY" in pair else 0.0001
-    stop_dist = _STOP_ATR_MULT * atr14
-    tgt_dist = _TARGET_ATR_MULT * atr14
+    stop_dist = max(
+        _STOP_ATR_MULT * atr14,
+        _MIN_STOP_PIPS * pip,
+        (spread_pips or 0.0) * _SPREAD_STOP_MULT * pip,
+    )
+    tgt_dist = _RR * stop_dist
     if direction == "LONG":
         stop = entry - stop_dist
         target = entry + tgt_dist
@@ -312,7 +322,7 @@ def _trade_levels(
         "suggested_target": round(target, 6),
         "stop_pips": round(stop_dist / pip, 1),
         "target_pips": round(tgt_dist / pip, 1),
-        "rr_ratio": round(_TARGET_ATR_MULT / _STOP_ATR_MULT, 2),
+        "rr_ratio": round(_RR, 2),
     }
 
 
@@ -389,9 +399,20 @@ def score_pair(
     if spread_pips is not None and spread_pips > max_spread_pips:
         total = max(0, total - 20)
 
+    # H1 alignment gate: forward-tested outcomes showed candidates firing against the
+    # H1 trend were the biggest loss bucket. An actionable signal must not fight H1.
+    h1_opposes = (
+        dominant in ("LONG", "SHORT")
+        and h1_direction in ("LONG", "SHORT")
+        and h1_direction != dominant
+    )
+
     if spread_pips is not None and spread_pips > max_spread_pips * 2:
         trade_signal = "AVOID"
         reason = f"Spread too wide ({spread_pips:.1f} pips)"
+    elif h1_opposes and total >= 45:
+        trade_signal = "WATCH_ONLY"
+        reason = f"{dominant} setup ({total:.0f}pts) but H1 trend is {h1_direction} — countertrend"
     elif total >= 70 and dominant == "LONG" and mtf_bonus >= 15:
         trade_signal = "STRONG_BUY"
         reason = f"Strong long setup ({total:.0f}pts, MTF:{mtf_confluence})"
@@ -413,7 +434,7 @@ def score_pair(
 
     # ATR-based stop/target/RR for actionable directions
     entry = round((bid + ask) / 2, 6) if bid and ask else close
-    levels = _trade_levels(dominant, entry, atr14, pair) if trade_signal not in (
+    levels = _trade_levels(dominant, entry, atr14, pair, spread_pips) if trade_signal not in (
         "AVOID", "WATCH_ONLY"
     ) else {}
     if levels and spread_pips is not None and levels["target_pips"] < spread_pips * 3:

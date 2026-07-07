@@ -390,9 +390,11 @@ class Storage:
             wins = sum(1 for r in rows if r["outcome"] == "WIN")
             n = len(rows)
             win_rate = round(wins / n, 3)
-            r_vals = [r["r_multiple"] for r in rows if r["r_multiple"] is not None]
-            avg_r = round(sum(r_vals) / len(r_vals), 2) if r_vals else 0.0
-            expectancy = round(avg_r * win_rate - (1 - win_rate), 3) if r_vals else 0.0
+            # avg_r = mean R of winners; expectancy = mean R across ALL trades (per-trade edge)
+            win_rs = [r["r_multiple"] for r in rows if r["outcome"] == "WIN" and r["r_multiple"] is not None]
+            all_rs = [r["r_multiple"] for r in rows if r["r_multiple"] is not None]
+            avg_r = round(sum(win_rs) / len(win_rs), 2) if win_rs else 0.0
+            expectancy = round(sum(all_rs) / len(all_rs), 3) if all_rs else 0.0
             return {"trades": n, "wins": wins, "win_rate": win_rate, "avg_r": avg_r, "expectancy": expectancy}
 
         insert_rows = []
@@ -439,6 +441,8 @@ class Storage:
 
     # ── Automatic signal tracking / calibration ─────────────────────────────
 
+    REARM_COOLDOWN_MINUTES = 45
+
     def record_tracked_signal(
         self, pair: str, signal: str, direction: int,
         entry: float, stop: float, target: float,
@@ -446,13 +450,17 @@ class Storage:
     ) -> None:
         """
         Record an actionable signal for hands-off forward evaluation. Skips if an
-        open signal already exists for this pair+direction (avoids re-arming every scan).
+        open signal already exists for this pair+direction (avoids re-arming every scan),
+        or if one was armed within the cooldown window — without this, every scan after
+        a stop-out immediately re-enters the same chop and racks up correlated losses.
         """
         with self._connect() as conn:
             existing = conn.execute(
                 "SELECT 1 FROM forex_signal_tracking "
-                "WHERE pair=? AND direction=? AND status='open' LIMIT 1",
-                (pair, direction),
+                "WHERE pair=? AND direction=? AND ("
+                "  status='open' OR created_at >= datetime('now', ?)"
+                ") LIMIT 1",
+                (pair, direction, f"-{self.REARM_COOLDOWN_MINUTES} minutes"),
             ).fetchone()
             if existing:
                 return

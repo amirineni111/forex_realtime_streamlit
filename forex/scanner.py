@@ -199,11 +199,20 @@ def run_scan(
                 storage.evaluate_tracked_signals(s.pair, pair_bars)
             except Exception as exc:
                 storage.log_pair(scan_id, s.pair, None, f"Tracking eval failed: {exc}")
+        # Thin-edge gate: don't forward-test signals whose target is under 3× the
+        # spread — transaction cost eats the whole move, so tracking them just
+        # pollutes the win-rate stats with untradeable noise.
+        thin_edge = (
+            s.spread_pips is not None
+            and s.target_pips is not None
+            and s.target_pips < s.spread_pips * 3
+        )
         if (
             s.trade_signal in _ACTIONABLE
             and s.suggested_stop is not None
             and s.suggested_target is not None
             and pair_bars
+            and not thin_edge
         ):
             direction = -1 if "SHORT" in s.trade_signal else 1
             try:

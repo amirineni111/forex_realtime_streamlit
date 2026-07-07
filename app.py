@@ -449,7 +449,7 @@ def _page_scanner(
 
     # ── Performance tab ───────────────────────────────────────────────────────
     with tab_perf:
-        outcomes = storage.load_trade_outcomes()
+        outcomes = storage.load_trade_outcomes(limit=10000)
         if not outcomes:
             st.info(
                 "No trade outcomes yet. Outcomes accrue automatically as each scan forward-tests "
@@ -458,49 +458,86 @@ def _page_scanner(
             )
         else:
             odf = pd.DataFrame(outcomes)
+            odf["date"] = pd.to_datetime(odf["created_at"]).dt.date.astype(str)
 
-            # Overall metrics
-            total_trades = len(odf)
-            wins = (odf["outcome"] == "WIN").sum()
+            # Date filter
+            all_dates = sorted(odf["date"].unique().tolist(), reverse=True)
+            date_choice = st.selectbox("Filter by date", ["All dates"] + all_dates)
+            fdf = odf if date_choice == "All dates" else odf[odf["date"] == date_choice]
+
+            # Overall metrics (respect date filter)
+            total_trades = len(fdf)
+            wins = int((fdf["outcome"] == "WIN").sum())
+            losses = int((fdf["outcome"] == "LOSS").sum())
             win_rate = wins / total_trades if total_trades else 0
-            r_vals = odf["r_multiple"].dropna()
-            avg_r = r_vals.mean() if len(r_vals) else 0.0
-            expectancy = avg_r * win_rate - (1 - win_rate) if len(r_vals) else 0.0
+            r_all = fdf["r_multiple"].dropna()
+            r_wins = fdf.loc[fdf["outcome"] == "WIN", "r_multiple"].dropna()
+            avg_win_r = r_wins.mean() if len(r_wins) else 0.0
+            expectancy = r_all.mean() if len(r_all) else 0.0
 
-            pm1, pm2, pm3, pm4 = st.columns(4)
-            pm1.metric("Total Trades", total_trades)
-            pm2.metric("Win Rate", f"{win_rate*100:.1f}%")
-            pm3.metric("Avg R:R", f"{avg_r:.2f}R")
-            pm4.metric("Expectancy", f"{expectancy:.3f}R")
+            pm1, pm2, pm3, pm4, pm5 = st.columns(5)
+            pm1.metric("Predictions", total_trades)
+            pm2.metric("Wins / Losses", f"{wins} / {losses}")
+            pm3.metric("Win Rate", f"{win_rate*100:.1f}%")
+            pm4.metric("Avg Win R", f"{avg_win_r:.2f}R")
+            pm5.metric("Expectancy", f"{expectancy:.3f}R/trade")
+            if date_choice != "All dates":
+                st.caption(f"{total_trades} predictions on {date_choice}: {wins} won, {losses} lost.")
 
-            # Equity curve (cumulative R)
-            if "r_multiple" in odf.columns:
+            # Daily results summary
+            st.subheader("Results by Day")
+            daily = (
+                odf.assign(
+                    win=(odf["outcome"] == "WIN").astype(int),
+                    loss=(odf["outcome"] == "LOSS").astype(int),
+                )
+                .groupby("date")
+                .agg(Predictions=("outcome", "size"), Wins=("win", "sum"), Losses=("loss", "sum"), R=("r_multiple", "sum"))
+                .reset_index()
+                .sort_values("date", ascending=False)
+            )
+            daily["Win Rate"] = (daily["Wins"] / daily["Predictions"] * 100).map("{:.1f}%".format)
+            daily["R"] = daily["R"].round(1)
+            daily.columns = ["Date", "Predictions", "Wins", "Losses", "Net R", "Win Rate"]
+            st.dataframe(
+                daily[["Date", "Predictions", "Wins", "Losses", "Win Rate", "Net R"]],
+                use_container_width=True, hide_index=True,
+            )
+
+            # Equity curve (cumulative R, respects date filter)
+            if "r_multiple" in fdf.columns and len(fdf):
                 st.subheader("Equity Curve (Cumulative R)")
-                cum_r = odf.sort_values("created_at")["r_multiple"].fillna(0).cumsum().reset_index(drop=True)
+                cum_r = fdf.sort_values("created_at")["r_multiple"].fillna(0).cumsum().reset_index(drop=True)
                 st.line_chart(cum_r)
 
-            # Win rate by pair
-            pair_stats = storage.load_performance_by_dimension("pair")
-            if pair_stats:
-                st.subheader("Win Rate by Pair")
-                pair_df = pd.DataFrame(pair_stats)[["dimension_value", "trades", "wins", "win_rate", "avg_r", "expectancy"]]
-                pair_df.columns = ["Pair", "Trades", "Wins", "Win Rate", "Avg R", "Expectancy"]
-                pair_df["Win Rate"] = pair_df["Win Rate"].apply(lambda x: f"{x*100:.1f}%")
-                st.dataframe(pair_df, use_container_width=True, hide_index=True)
+            # Win rate breakdowns (computed from the filtered set)
+            def _dim_table(df: pd.DataFrame, col: str, label: str) -> None:
+                if col not in df.columns or not len(df):
+                    return
+                grp = (
+                    df.assign(win=(df["outcome"] == "WIN").astype(int))
+                    .groupby(col)
+                    .agg(Trades=("outcome", "size"), Wins=("win", "sum"), Expectancy=("r_multiple", "mean"))
+                    .reset_index()
+                    .sort_values("Trades", ascending=False)
+                )
+                grp["Win Rate"] = (grp["Wins"] / grp["Trades"] * 100).map("{:.1f}%".format)
+                grp["Expectancy"] = grp["Expectancy"].round(3)
+                grp.columns = [label, "Trades", "Wins", "Expectancy", "Win Rate"]
+                st.subheader(f"Win Rate by {label}")
+                st.dataframe(
+                    grp[[label, "Trades", "Wins", "Win Rate", "Expectancy"]],
+                    use_container_width=True, hide_index=True,
+                )
 
-            # Win rate by signal type
-            sig_stats = storage.load_performance_by_dimension("signal")
-            if sig_stats:
-                st.subheader("Win Rate by Signal")
-                sig_df = pd.DataFrame(sig_stats)[["dimension_value", "trades", "wins", "win_rate", "avg_r", "expectancy"]]
-                sig_df.columns = ["Signal", "Trades", "Wins", "Win Rate", "Avg R", "Expectancy"]
-                sig_df["Win Rate"] = sig_df["Win Rate"].apply(lambda x: f"{x*100:.1f}%")
-                st.dataframe(sig_df, use_container_width=True, hide_index=True)
+            fdf_display = fdf.copy()
+            fdf_display["pair"] = fdf_display["pair"].apply(format_pair)
+            _dim_table(fdf_display, "pair", "Pair")
+            _dim_table(fdf_display, "signal", "Signal")
 
             # Recent trade log
             with st.expander("Trade History"):
-                odf["pair"] = odf["pair"].apply(format_pair)
-                st.dataframe(odf, use_container_width=True, hide_index=True)
+                st.dataframe(fdf_display, use_container_width=True, hide_index=True)
 
         # Open auto-tracked signals (forward-testing in progress)
         open_tracked = storage.load_tracked_signals("open")
