@@ -51,6 +51,8 @@ def _init_state() -> None:
         "oanda_env": prefs.get("oanda_env", "practice"),
         "auto_refresh": prefs.get("auto_refresh", False),
         "refresh_seconds": prefs.get("refresh_seconds", 60),
+        "universe_choice": prefs.get("universe_choice", "Majors"),
+        "custom_pairs_raw": prefs.get("custom_pairs_raw", ""),
         "auto_refresh_count_last": 0,
         "quotes_auto_refresh_count_last": 0,
     }
@@ -142,17 +144,23 @@ def _render_sidebar() -> tuple:
 
     # Pair universe
     st.sidebar.subheader("Pair Universe")
+    universe_options = list(UNIVERSE_MAP.keys()) + ["Custom"]
+    saved_choice = st.session_state.universe_choice
     universe_choice = st.sidebar.radio(
         "Universe",
-        list(UNIVERSE_MAP.keys()) + ["Custom"],
+        universe_options,
+        index=universe_options.index(saved_choice) if saved_choice in universe_options else 0,
         horizontal=False,
     )
+    st.session_state.universe_choice = universe_choice
     if universe_choice == "Custom":
         custom_raw = st.sidebar.text_area(
             "Custom pairs (one per line, e.g. EUR_USD)",
+            value=st.session_state.custom_pairs_raw,
             height=120,
             placeholder="EUR_USD\nGBP_USD\nUSD_JPY",
         )
+        st.session_state.custom_pairs_raw = custom_raw
         selected_pairs = [
             p.strip().upper()
             for p in custom_raw.replace(",", "\n").splitlines()
@@ -194,6 +202,8 @@ def _render_sidebar() -> tuple:
         "oanda_env": oanda_env,
         "auto_refresh": auto_refresh,
         "refresh_seconds": refresh_secs,
+        "universe_choice": st.session_state.universe_choice,
+        "custom_pairs_raw": st.session_state.custom_pairs_raw,
     })
 
     return api_key, selected_pairs, max_spread, signal_mode, auto_refresh, refresh_secs
