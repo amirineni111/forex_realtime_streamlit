@@ -2,6 +2,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import List, Optional, Tuple
 
+from .timeutil import parse_ts
+
 
 def _ema(values: List[float], period: int) -> Optional[float]:
     if len(values) < period:
@@ -160,18 +162,7 @@ def calculate_adx(
 
 def _parse_oanda_ts(ts: str) -> Optional[datetime]:
     """Parse OANDA RFC3339 timestamps (which carry 9-digit nanosecond fractions)."""
-    if not ts:
-        return None
-    try:
-        if "." in ts:
-            head, frac = ts.split(".", 1)
-            frac = frac.rstrip("Z")[:6]  # fromisoformat handles <= microseconds
-            iso = f"{head}.{frac}+00:00"
-        else:
-            iso = ts.replace("Z", "+00:00")
-        return datetime.fromisoformat(iso)
-    except (ValueError, TypeError):
-        return None
+    return parse_ts(ts)
 
 
 def session_high_low(

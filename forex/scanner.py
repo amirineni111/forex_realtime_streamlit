@@ -14,8 +14,41 @@ from .indicators import (
     session_high_low,
 )
 from .signals import score_pair
+from .features import build_features, FEATURE_VERSION
 from .market_sessions import current_session, current_session_start_utc
 from .strength import calculate_strength, get_strength_for_pair, strength_bonus
+
+
+def _apply_scoring(s: ForexSnapshot, scoring: dict) -> None:
+    """Copy a score_pair result onto a snapshot (used for the final scoring pass)."""
+    for field in (
+        "momentum_score", "reversion_score", "session_score", "regime",
+        "total_score", "trade_signal", "signal_reason", "risk_notes",
+        "suggested_entry", "suggested_stop", "suggested_target",
+        "stop_pips", "target_pips", "rr_ratio",
+        "mtf_score", "mtf_confluence", "sr_score", "at_key_level",
+        "nearest_support", "nearest_resistance", "sr_levels_json",
+        "blocked_ahead", "cost_ratio", "model_prob", "required_prob",
+    ):
+        if field in scoring:
+            setattr(s, field, scoring[field])
+
+
+def _load_model(storage: Storage):
+    """Active direction model, or None when the loop has not been trained yet."""
+    try:
+        payload = storage.load_active_model_json()
+        if not payload:
+            return None
+        from .model import ForexModel
+        model = ForexModel.from_json(payload)
+        # A model trained on a different feature contract would be silently
+        # misaligned — refuse it rather than serve garbage probabilities.
+        if model.feature_version != FEATURE_VERSION:
+            return None
+        return model
+    except Exception:
+        return None
 
 
 def run_scan(
@@ -100,6 +133,10 @@ def run_scan(
             spread_pips = quote.spread_pips if quote else None
             as_of = quote.as_of if quote else datetime.now(timezone.utc).isoformat()
 
+            # Rules-only first pass. The model probability and the currency-strength
+            # bonus both need information that is only available once every pair has
+            # been fetched, so the final score is recomputed in the sequential phase
+            # below with those inputs supplied.
             scoring = score_pair(
                 pair=pair,
                 bid=bid,
@@ -112,6 +149,12 @@ def run_scan(
                 h4_direction=h4_direction,
                 sr_levels=sr_levels,
             )
+            ctx = {
+                "bid": bid, "ask": ask, "spread_pips": spread_pips,
+                "indicators": indicators, "session": session,
+                "h1_direction": h1_direction, "h4_direction": h4_direction,
+                "sr_levels": sr_levels, "as_of": as_of,
+            }
 
             snapshot = ForexSnapshot(
                 pair=pair,
@@ -166,31 +209,104 @@ def run_scan(
                 sr_score=scoring.get("sr_score", 0.0),
                 at_key_level=scoring.get("at_key_level", False),
                 sr_levels_json=scoring.get("sr_levels_json"),
+                blocked_ahead=scoring.get("blocked_ahead", False),
+                cost_ratio=scoring.get("cost_ratio"),
             )
-            return pair, snapshot, None, bar_dicts
+            return pair, snapshot, None, bar_dicts, ctx
 
         except Exception as exc:
-            return pair, None, str(exc), []
+            return pair, None, str(exc), [], None
 
     snapshots: List[ForexSnapshot] = []
     bars_by_pair: dict = {}
+    ctx_by_pair: dict = {}
     with ThreadPoolExecutor(max_workers=8) as executor:
         futures = {executor.submit(_process_pair, pair): pair for pair in request.pairs}
         for future in as_completed(futures):
-            pair, snapshot, error, m5_bars = future.result()
+            pair, snapshot, error, m5_bars, ctx = future.result()
             if error:
                 summary.errors += 1
                 storage.log_pair(scan_id, pair, None, error)
             else:
                 snapshots.append(snapshot)
                 bars_by_pair[pair] = m5_bars
+                ctx_by_pair[pair] = ctx
                 summary.pairs_scanned += 1
-                storage.log_pair(scan_id, pair, snapshot.trade_signal, None)
-                if snapshot.trade_signal not in ("AVOID", "WATCH_ONLY"):
-                    summary.signals_found += 1
 
-    # Forward-evaluate previously-tracked signals against this scan's fresh bars, then
-    # arm any new actionable signals. All DB writes stay single-threaded here.
+    # ── Sequential phase ────────────────────────────────────────────────────
+    # Currency strength needs every pair's day change, and the model needs currency
+    # strength, so both run here rather than inside the parallel fetch. All DB writes
+    # are single-threaded in this block.
+    model = _load_model(storage)
+
+    strength_scores = calculate_strength([s.model_dump() for s in snapshots]) if snapshots else {}
+    for s in snapshots:
+        base_str, quote_str, assessment = get_strength_for_pair(s.pair, strength_scores)
+        s.base_strength = base_str
+        s.quote_strength = quote_str
+        s.strength_assessment = assessment
+
+    # Final scoring pass: strength bonus folded into total_score, then the model
+    # probability applied as a veto on anything the rules proposed.
+    features_by_pair: dict = {}
+    for s in snapshots:
+        ctx = ctx_by_pair.get(s.pair)
+        if not ctx:
+            continue
+
+        def _rescore(prob, bonus):
+            return score_pair(
+                pair=s.pair, bid=ctx["bid"], ask=ctx["ask"],
+                spread_pips=ctx["spread_pips"], indicators=ctx["indicators"],
+                session=ctx["session"], max_spread_pips=request.max_spread_pips,
+                h1_direction=ctx["h1_direction"], h4_direction=ctx["h4_direction"],
+                sr_levels=ctx["sr_levels"], model_prob=prob, strength_bonus=bonus,
+            )
+
+        # Strength alignment is judged against the raw directional read, not against
+        # the first-pass label — a countertrend setup downgraded to WATCH_ONLY still
+        # has a direction, and keying off the label would silently zero the bonus.
+        base = _rescore(None, 0.0)
+        dom = base.get("dominant")
+        bonus = strength_bonus(
+            s.strength_assessment or "NEUTRAL",
+            "STRONG_BUY" if dom == "LONG" else ("STRONG_SHORT" if dom == "SHORT" else "WATCH_ONLY"),
+        )
+        scoring = _rescore(None, bonus) if bonus else base
+
+        # Features are built for every directional setup whether or not a model
+        # exists yet. Building them only when a model was loaded would deadlock the
+        # loop: no model means no logged features, which means no training data,
+        # which means a model can never be trained.
+        if scoring.get("dominant") in ("LONG", "SHORT"):
+            direction = 1 if scoring["dominant"] == "LONG" else -1
+            feat_snap = {
+                **ctx["indicators"], **scoring,
+                "spread_pips": ctx["spread_pips"],
+                "stop_pips": scoring.get("prov_stop_pips"),
+                "h1_direction": ctx["h1_direction"],
+                "h4_direction": ctx["h4_direction"],
+                "current_session": ctx["session"],
+                "as_of": ctx["as_of"],
+                "base_strength": s.base_strength,
+                "quote_strength": s.quote_strength,
+            }
+            feats = build_features(feat_snap, direction)
+            features_by_pair[s.pair] = feats
+
+            if model is not None:
+                try:
+                    model_prob = round(model.predict_proba(feats), 4)
+                except Exception as exc:
+                    storage.log_pair(scan_id, s.pair, None, f"Model scoring failed: {exc}")
+                    model_prob = None
+                if model_prob is not None:
+                    scoring = _rescore(model_prob, bonus)
+
+        _apply_scoring(s, scoring)
+
+    # Forward-evaluate previously-tracked signals against this scan's fresh bars,
+    # then arm any new actionable signals.
     _ACTIONABLE = ("STRONG_BUY", "BUY_CANDIDATE", "STRONG_SHORT", "SHORT_CANDIDATE")
     for s in snapshots:
         pair_bars = bars_by_pair.get(s.pair) or []
@@ -199,14 +315,23 @@ def run_scan(
                 storage.evaluate_tracked_signals(s.pair, pair_bars)
             except Exception as exc:
                 storage.log_pair(scan_id, s.pair, None, f"Tracking eval failed: {exc}")
-        # Thin-edge gate: don't forward-test signals whose target is under 3× the
-        # spread — transaction cost eats the whole move, so tracking them just
-        # pollutes the win-rate stats with untradeable noise.
+
+        storage.log_pair(scan_id, s.pair, s.trade_signal, None)
+        if s.trade_signal not in ("AVOID", "WATCH_ONLY"):
+            summary.signals_found += 1
+
+        # Thin-edge gate: don't forward-test signals whose target cannot clear the
+        # round-trip cost by a sensible margin. The old 3× bar still left a third of
+        # the target being paid away in spread; the cost_ratio veto in score_pair now
+        # carries most of this, and 6× is the belt-and-braces check on the target side.
         thin_edge = (
             s.spread_pips is not None
             and s.target_pips is not None
-            and s.target_pips < s.spread_pips * 3
+            and s.target_pips < s.spread_pips * 6
         )
+        if thin_edge and s.trade_signal in _ACTIONABLE:
+            storage.log_pair(scan_id, s.pair, None,
+                             f"Skipped tracking: target {s.target_pips}p < 6× spread")
         if (
             s.trade_signal in _ACTIONABLE
             and s.suggested_stop is not None
@@ -227,20 +352,21 @@ def run_scan(
                     target_pips=s.target_pips or 0.0,
                     atr14=s.atr14 or 0.0,
                     entry_ts=pair_bars[-1]["timestamp"],
+                    # The feature vector as it stood when the trade was armed. This is
+                    # the row the next retrain learns from.
+                    features=features_by_pair.get(s.pair),
+                    feature_version=FEATURE_VERSION,
+                    model_prob=s.model_prob,
+                    required_prob=s.required_prob,
+                    cost_ratio=s.cost_ratio,
+                    spread_pips=s.spread_pips,
+                    total_score=s.total_score,
+                    adx14=s.adx14,
+                    regime=s.regime,
+                    session=s.current_session,
                 )
             except Exception as exc:
                 storage.log_pair(scan_id, s.pair, None, f"Tracking record failed: {exc}")
-
-    # Post-scan: compute currency strength and adjust scores
-    if snapshots:
-        strength_scores = calculate_strength([s.model_dump() for s in snapshots])
-        for s in snapshots:
-            base_str, quote_str, assessment = get_strength_for_pair(s.pair, strength_scores)
-            s.base_strength = base_str
-            s.quote_strength = quote_str
-            s.strength_assessment = assessment
-            bonus = strength_bonus(assessment, s.trade_signal)
-            s.total_score = round(s.total_score + bonus, 1)
 
     # Sort by score descending (after strength adjustment)
     snapshots.sort(key=lambda s: s.total_score, reverse=True)

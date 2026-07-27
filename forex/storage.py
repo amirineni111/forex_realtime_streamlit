@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from .models import ForexSnapshot, ForexQuote, ScanSummary
+from .timeutil import parse_ts
 
 SQLITE_TIMEOUT = 30.0
 SQLITE_BUSY_MS = 30000
@@ -149,36 +150,100 @@ class Storage:
                     avg_r           REAL,
                     expectancy      REAL
                 );
+
+                -- Trained direction models. Coefficients are stored inline so the
+                -- scanner can serve predictions without a model file on disk, and so
+                -- every historical model stays auditable against its own metrics.
+                CREATE TABLE IF NOT EXISTS forex_models (
+                    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at       TEXT DEFAULT CURRENT_TIMESTAMP,
+                    feature_version  INTEGER,
+                    algo             TEXT,
+                    n_train          INTEGER,
+                    n_test           INTEGER,
+                    auc              REAL,
+                    brier            REAL,
+                    top_decile_prec  REAL,
+                    base_rate        REAL,
+                    model_json       TEXT,
+                    metrics_json     TEXT,
+                    is_active        INTEGER DEFAULT 0,
+                    notes            TEXT
+                );
             """)
-        # Migrate existing forex_snapshots with new columns (safe on repeated startup)
-        new_cols = [
-            ("h1_direction", "TEXT"),
-            ("h4_direction", "TEXT"),
-            ("mtf_score", "REAL DEFAULT 0"),
-            ("mtf_confluence", "TEXT"),
-            ("nearest_support", "REAL"),
-            ("nearest_resistance", "REAL"),
-            ("sr_score", "REAL DEFAULT 0"),
-            ("at_key_level", "INTEGER DEFAULT 0"),
-            ("sr_levels_json", "TEXT"),
-            ("base_strength", "REAL"),
-            ("quote_strength", "REAL"),
-            ("strength_assessment", "TEXT"),
-            ("adx14", "REAL"),
-            ("regime", "TEXT"),
-            ("suggested_entry", "REAL"),
-            ("suggested_stop", "REAL"),
-            ("suggested_target", "REAL"),
-            ("stop_pips", "REAL"),
-            ("target_pips", "REAL"),
-            ("rr_ratio", "REAL"),
-        ]
-        for col, typedef in new_cols:
-            try:
-                with self._connect() as conn:
-                    conn.execute(f"ALTER TABLE forex_snapshots ADD COLUMN {col} {typedef}")
-            except sqlite3.OperationalError:
-                pass  # column already exists
+
+        # Additive column migrations, safe to re-run on every startup.
+        migrations = {
+            "forex_snapshots": [
+                ("h1_direction", "TEXT"),
+                ("h4_direction", "TEXT"),
+                ("mtf_score", "REAL DEFAULT 0"),
+                ("mtf_confluence", "TEXT"),
+                ("nearest_support", "REAL"),
+                ("nearest_resistance", "REAL"),
+                ("sr_score", "REAL DEFAULT 0"),
+                ("at_key_level", "INTEGER DEFAULT 0"),
+                ("sr_levels_json", "TEXT"),
+                ("base_strength", "REAL"),
+                ("quote_strength", "REAL"),
+                ("strength_assessment", "TEXT"),
+                ("adx14", "REAL"),
+                ("regime", "TEXT"),
+                ("suggested_entry", "REAL"),
+                ("suggested_stop", "REAL"),
+                ("suggested_target", "REAL"),
+                ("stop_pips", "REAL"),
+                ("target_pips", "REAL"),
+                ("rr_ratio", "REAL"),
+                ("blocked_ahead", "INTEGER DEFAULT 0"),
+                ("cost_ratio", "REAL"),
+                ("model_prob", "REAL"),
+                ("required_prob", "REAL"),
+            ],
+            # The feature snapshot at arm time. Without this the outcome rows are
+            # unlearnable — 910 labelled trades were previously recorded with every
+            # input discarded, which is what blocked any model work.
+            "forex_signal_tracking": [
+                ("features_json", "TEXT"),
+                ("feature_version", "INTEGER"),
+                ("model_prob", "REAL"),
+                ("required_prob", "REAL"),
+                ("cost_ratio", "REAL"),
+                ("spread_pips", "REAL"),
+                ("total_score", "REAL"),
+                ("adx14", "REAL"),
+                ("regime", "TEXT"),
+                ("session", "TEXT"),
+            ],
+            # tracking_id closes the loop: an outcome can now be joined back to the
+            # exact feature vector that produced it.
+            "forex_trade_outcomes": [
+                ("tracking_id", "INTEGER"),
+                ("gross_pips", "REAL"),
+                ("cost_pips", "REAL"),
+                ("net_pips", "REAL"),
+                ("exit_ts", "TEXT"),
+                ("exit_reason", "TEXT"),
+            ],
+        }
+        for table, cols in migrations.items():
+            for col, typedef in cols:
+                try:
+                    with self._connect() as conn:
+                        conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typedef}")
+                except sqlite3.OperationalError:
+                    pass  # column already exists
+
+        # Indexes go last — they reference columns added by the migrations above.
+        with self._connect() as conn:
+            conn.executescript("""
+                CREATE INDEX IF NOT EXISTS idx_tracking_status
+                    ON forex_signal_tracking(status, pair);
+                CREATE INDEX IF NOT EXISTS idx_outcomes_tracking
+                    ON forex_trade_outcomes(tracking_id);
+                CREATE INDEX IF NOT EXISTS idx_models_active
+                    ON forex_models(is_active, created_at);
+            """)
 
     # ── Scan run lifecycle ──────────────────────────────────────────────────
 
@@ -242,6 +307,8 @@ class Storage:
                 s.adx14, s.regime,
                 s.suggested_entry, s.suggested_stop, s.suggested_target,
                 s.stop_pips, s.target_pips, s.rr_ratio,
+                # Structure / cost / model gating
+                int(s.blocked_ahead), s.cost_ratio, s.model_prob, s.required_prob,
             ))
         with self._connect() as conn:
             conn.executemany(
@@ -256,9 +323,10 @@ class Storage:
                 "nearest_support,nearest_resistance,sr_score,at_key_level,sr_levels_json,"
                 "base_strength,quote_strength,strength_assessment,"
                 "adx14,regime,suggested_entry,suggested_stop,suggested_target,"
-                "stop_pips,target_pips,rr_ratio) "
+                "stop_pips,target_pips,rr_ratio,"
+                "blocked_ahead,cost_ratio,model_prob,required_prob) "
                 "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
-                "?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 rows,
             )
 
@@ -447,12 +515,27 @@ class Storage:
         self, pair: str, signal: str, direction: int,
         entry: float, stop: float, target: float,
         stop_pips: float, target_pips: float, atr14: float, entry_ts: str,
-    ) -> None:
+        features: Optional[dict] = None,
+        feature_version: Optional[int] = None,
+        model_prob: Optional[float] = None,
+        required_prob: Optional[float] = None,
+        cost_ratio: Optional[float] = None,
+        spread_pips: Optional[float] = None,
+        total_score: Optional[float] = None,
+        adx14: Optional[float] = None,
+        regime: Optional[str] = None,
+        session: Optional[str] = None,
+    ) -> Optional[int]:
         """
         Record an actionable signal for hands-off forward evaluation. Skips if an
         open signal already exists for this pair+direction (avoids re-arming every scan),
         or if one was armed within the cooldown window — without this, every scan after
         a stop-out immediately re-enters the same chop and racks up correlated losses.
+
+        ``features`` is the model feature vector captured **at arm time**. Storing it
+        here (rather than recomputing later from a snapshot that has since been pruned)
+        is what makes the outcome learnable. Returns the new tracking id, or None if
+        the signal was suppressed by the dedupe/cooldown rule.
         """
         with self._connect() as conn:
             existing = conn.execute(
@@ -463,17 +546,24 @@ class Storage:
                 (pair, direction, f"-{self.REARM_COOLDOWN_MINUTES} minutes"),
             ).fetchone()
             if existing:
-                return
-            conn.execute(
+                return None
+            cur = conn.execute(
                 "INSERT INTO forex_signal_tracking "
                 "(pair,signal,direction,entry_price,stop_price,target_price,"
-                "stop_pips,target_pips,atr14,entry_ts) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                "stop_pips,target_pips,atr14,entry_ts,"
+                "features_json,feature_version,model_prob,required_prob,cost_ratio,"
+                "spread_pips,total_score,adx14,regime,session) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (pair, signal, direction, entry, stop, target,
-                 stop_pips, target_pips, atr14, entry_ts),
+                 stop_pips, target_pips, atr14, entry_ts,
+                 json.dumps(features) if features else None, feature_version,
+                 model_prob, required_prob, cost_ratio,
+                 spread_pips, total_score, adx14, regime, session),
             )
+            return cur.lastrowid
 
     def evaluate_tracked_signals(
-        self, pair: str, bars: List[dict], max_hold_hours: float = 8.0,
+        self, pair: str, bars: List[dict], max_hold_hours: float = 12.0,
     ) -> int:
         """
         Resolve open tracked signals for ``pair`` against forward M5 bars: a stop or
@@ -481,6 +571,11 @@ class Storage:
         ``max_hold_hours``. Resolved trades feed forex_trade_outcomes (the same table the
         Performance tab reads), so win-rate-by-signal calibrates itself over time.
         Returns the number of signals resolved.
+
+        Accounting is net of transaction cost. Candles are mid prices, so a bracket
+        that touches its mid target still costs the full spread to get in and out —
+        ``r_multiple`` is therefore computed from ``net_pips``. Reporting gross R was
+        overstating every result by roughly a quarter of an R at the measured spreads.
         """
         with self._connect() as conn:
             open_rows = [dict(r) for r in conn.execute(
@@ -506,46 +601,68 @@ class Storage:
 
             exit_price: Optional[float] = None
             outcome: Optional[str] = None
+            exit_ts: Optional[str] = None
+            exit_reason: Optional[str] = None
             for b in forward:
                 hi, lo = b["high"], b["low"]
                 if direction == 1:
                     if lo <= stop:        # stop checked first = conservative
-                        exit_price, outcome = stop, "LOSS"
+                        exit_price, outcome, exit_reason = stop, "LOSS", "STOP"
+                        exit_ts = b.get("timestamp")
                         break
                     if hi >= target:
-                        exit_price, outcome = target, "WIN"
+                        exit_price, outcome, exit_reason = target, "WIN", "TARGET"
+                        exit_ts = b.get("timestamp")
                         break
                 else:
                     if hi >= stop:
-                        exit_price, outcome = stop, "LOSS"
+                        exit_price, outcome, exit_reason = stop, "LOSS", "STOP"
+                        exit_ts = b.get("timestamp")
                         break
                     if lo <= target:
-                        exit_price, outcome = target, "WIN"
+                        exit_price, outcome, exit_reason = target, "WIN", "TARGET"
+                        exit_ts = b.get("timestamp")
                         break
 
+            created = self._parse_dt(row.get("created_at"))
             if outcome is None:
                 # Timeout: close at last available close once held longer than max_hold
-                created = self._parse_dt(row.get("created_at"))
                 aged_out = created is not None and (now - created).total_seconds() > max_hold_hours * 3600
                 if aged_out and forward:
                     exit_price = forward[-1]["close"]
-                    pnl = (exit_price - entry_price) * direction
-                    outcome = "WIN" if pnl > 0 else ("LOSS" if pnl < 0 else "BREAKEVEN")
+                    exit_ts = forward[-1].get("timestamp")
+                    exit_reason = "TIMEOUT"
                 else:
                     continue  # still live
 
-            exit_pips = round((exit_price - entry_price) * direction / pip_value, 1) if entry_price else 0.0
-            r_multiple = round(exit_pips / stop_pips, 2) if stop_pips and stop_pips > 0 else None
-            created = self._parse_dt(row.get("created_at"))
-            hold_minutes = int((now - created).total_seconds() / 60) if created else None
+            gross_pips = round((exit_price - entry_price) * direction / pip_value, 1) if entry_price else 0.0
+            # Full round-trip spread: entered at ask (long) / bid (short) and exited on
+            # the opposite side, while the bar data that triggered the exit is mid.
+            cost_pips = round(row.get("spread_pips") or 0.0, 1)
+            net_pips = round(gross_pips - cost_pips, 1)
+            if exit_reason == "TIMEOUT":
+                outcome = "WIN" if net_pips > 0 else ("LOSS" if net_pips < 0 else "BREAKEVEN")
+            r_multiple = round(net_pips / stop_pips, 2) if stop_pips and stop_pips > 0 else None
+
+            # Real trade duration: entry bar → resolving bar. This used to be measured
+            # as (now − created_at), i.e. how long until a scan happened to evaluate the
+            # row, which is why wins and losses both averaged ~506 minutes.
+            entry_dt = self._parse_dt(entry_ts) or created
+            exit_dt = self._parse_dt(exit_ts)
+            if entry_dt and exit_dt:
+                hold_minutes = max(0, int((exit_dt - entry_dt).total_seconds() / 60))
+            else:
+                hold_minutes = None
 
             with self._connect() as conn:
                 conn.execute(
                     "INSERT INTO forex_trade_outcomes "
-                    "(watchlist_id,pair,signal,entry_price,exit_price,exit_pips,"
-                    "r_multiple,outcome,hold_minutes) VALUES (0,?,?,?,?,?,?,?,?)",
-                    (pair, row.get("signal"), entry_price, exit_price, exit_pips,
-                     r_multiple, outcome, hold_minutes),
+                    "(watchlist_id,tracking_id,pair,signal,entry_price,exit_price,exit_pips,"
+                    "gross_pips,cost_pips,net_pips,r_multiple,outcome,hold_minutes,"
+                    "exit_ts,exit_reason) VALUES (0,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (row["id"], pair, row.get("signal"), entry_price, exit_price, net_pips,
+                     gross_pips, cost_pips, net_pips, r_multiple, outcome, hold_minutes,
+                     exit_ts, exit_reason),
                 )
                 conn.execute(
                     "UPDATE forex_signal_tracking SET status='closed' WHERE id=?",
@@ -557,20 +674,114 @@ class Storage:
             self.compute_and_save_performance()
         return resolved
 
-    @staticmethod
-    def _parse_dt(value: Optional[str]) -> Optional[datetime]:
-        if not value:
-            return None
-        try:
-            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
-            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
-        except (ValueError, TypeError):
-            return None
+    _parse_dt = staticmethod(parse_ts)
 
     def load_tracked_signals(self, status: str = "open", limit: int = 200) -> list:
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT * FROM forex_signal_tracking WHERE status=? "
                 "ORDER BY created_at DESC LIMIT ?", (status, limit),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ── Model store / training data ─────────────────────────────────────────
+
+    def load_training_rows(self, feature_version: Optional[int] = None) -> list:
+        """
+        Resolved trades joined back to the feature vector captured at arm time.
+
+        Only rows with a stored ``features_json`` are usable — trades recorded before
+        feature logging existed are unlearnable and are excluded here rather than
+        silently imputed, which would teach the model from fabricated inputs.
+        Ordered oldest-first so a walk-forward split is just an index cut.
+        """
+        sql = (
+            "SELECT t.id AS tracking_id, t.features_json, t.feature_version, t.pair, "
+            "       t.direction, t.signal, t.created_at, t.model_prob, "
+            "       o.outcome, o.r_multiple, o.net_pips, o.exit_reason "
+            "FROM forex_signal_tracking t "
+            "JOIN forex_trade_outcomes o ON o.tracking_id = t.id "
+            "WHERE t.features_json IS NOT NULL AND o.outcome IS NOT NULL "
+        )
+        params: list = []
+        if feature_version is not None:
+            sql += "AND t.feature_version = ? "
+            params.append(feature_version)
+        sql += "ORDER BY t.created_at ASC, t.id ASC"
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+
+        out = []
+        for r in rows:
+            row = dict(r)
+            try:
+                row["features"] = json.loads(row.pop("features_json") or "{}")
+            except (ValueError, TypeError):
+                continue
+            if not row["features"]:
+                continue
+            out.append(row)
+        return out
+
+    def save_model(self, model_json: str, metrics: dict, activate: bool = True,
+                   notes: str = "") -> int:
+        """Persist a trained model and optionally make it the one the scanner serves."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO forex_models "
+                "(feature_version,algo,n_train,n_test,auc,brier,top_decile_prec,"
+                " base_rate,model_json,metrics_json,is_active,notes) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,0,?)",
+                (
+                    metrics.get("feature_version"), metrics.get("algo"),
+                    metrics.get("n_train"), metrics.get("n_test"),
+                    metrics.get("auc"), metrics.get("brier"),
+                    metrics.get("top_decile_prec"), metrics.get("base_rate"),
+                    model_json, json.dumps(metrics), notes,
+                ),
+            )
+            model_id = cur.lastrowid
+            if activate:
+                conn.execute("UPDATE forex_models SET is_active=0")
+                conn.execute("UPDATE forex_models SET is_active=1 WHERE id=?", (model_id,))
+        return model_id
+
+    def activate_model(self, model_id: int) -> bool:
+        """
+        Promote one stored model to active, deactivating every other.
+
+        Also used for rollback — promoting an older model id is a valid recovery
+        path when a newly promoted one turns out to behave badly live.
+        Returns False if the id does not exist.
+        """
+        with self._connect() as conn:
+            exists = conn.execute(
+                "SELECT 1 FROM forex_models WHERE id=?", (model_id,)
+            ).fetchone()
+            if not exists:
+                return False
+            conn.execute("UPDATE forex_models SET is_active=0")
+            conn.execute("UPDATE forex_models SET is_active=1 WHERE id=?", (model_id,))
+        return True
+
+    def deactivate_all_models(self) -> None:
+        """Fall back to rules-only scanning without deleting any model."""
+        with self._connect() as conn:
+            conn.execute("UPDATE forex_models SET is_active=0")
+
+    def load_active_model_json(self) -> Optional[str]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT model_json FROM forex_models WHERE is_active=1 "
+                "ORDER BY created_at DESC LIMIT 1"
+            ).fetchone()
+        return row["model_json"] if row else None
+
+    def load_models(self, limit: int = 20) -> list:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id,created_at,algo,feature_version,n_train,n_test,auc,brier,"
+                "top_decile_prec,base_rate,is_active,notes "
+                "FROM forex_models ORDER BY created_at DESC LIMIT ?", (limit,)
             ).fetchall()
         return [dict(r) for r in rows]

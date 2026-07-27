@@ -8,12 +8,15 @@ import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
 from forex.config import AppSettings, get_settings
+from forex.features import FEATURE_VERSION
 from forex.market_sessions import current_session, is_forex_market_open, session_badge_color
+from forex.model import MIN_TRAIN_SAMPLES
 from forex.models import ScanRequest
 from forex.pairs import UNIVERSE_MAP, format_pair
 from forex.scanner import run_scan
 from forex.storage import Storage
 from forex.strength import calculate_strength, CURRENCIES
+from forex.training import evaluate_and_fit, gate_summary, save_candidate
 
 st.set_page_config(
     page_title="Forex Trading Dashboard",
@@ -55,6 +58,9 @@ def _init_state() -> None:
         "custom_pairs_raw": prefs.get("custom_pairs_raw", ""),
         "auto_refresh_count_last": 0,
         "quotes_auto_refresh_count_last": 0,
+        # Candidate model report, held across reruns so the retrain result survives
+        # until it is promoted or a new retrain replaces it.
+        "model_report": None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -263,8 +269,8 @@ def _page_scanner(
             except Exception as exc:
                 st.error(f"Scan failed: {exc}")
 
-    tab_results, tab_watchlist, tab_perf, tab_logs, tab_settings = st.tabs(
-        ["Results", "Watchlist", "Performance", "Scan Logs", "Settings"]
+    tab_results, tab_watchlist, tab_perf, tab_model, tab_logs, tab_settings = st.tabs(
+        ["Results", "Watchlist", "Performance", "Model", "Scan Logs", "Settings"]
     )
 
     # ── Results tab ──────────────────────────────────────────────────────────
@@ -322,15 +328,17 @@ def _page_scanner(
             # Format display columns
             display_cols = [
                 "pair", "trade_signal", "total_score", "regime",
+                "model_prob", "required_prob",
                 "momentum_score", "reversion_score", "session_score",
                 "mtf_score", "mtf_confluence",
                 "bid", "ask",
                 "suggested_entry", "suggested_stop", "suggested_target",
                 "stop_pips", "target_pips",
                 "h1_direction", "h4_direction",
-                "sr_score", "at_key_level", "nearest_support", "nearest_resistance",
+                "sr_score", "at_key_level", "blocked_ahead",
+                "nearest_support", "nearest_resistance",
                 "strength_assessment",
-                "rr_ratio", "spread_pips",
+                "rr_ratio", "spread_pips", "cost_ratio",
                 "close", "day_change_pct",
                 "rsi14", "adx14", "macd_histogram", "ema9", "ema20",
                 "atr14", "bb_width_pct",
@@ -352,14 +360,29 @@ def _page_scanner(
                 "suggested_entry", "suggested_stop", "suggested_target",
             ] if c in display.columns}
 
-            def _highlight_key_level(row):
+            def _fmt_pct(x):
+                try:
+                    return f"{x:.0%}" if x is not None and x == x else ""
+                except (TypeError, ValueError):
+                    return ""
+
+            price_cols.update({
+                c: _fmt_pct for c in ["model_prob", "required_prob", "cost_ratio"]
+                if c in display.columns
+            })
+
+            def _highlight_row(row):
+                # Structure blocking the target is the more actionable warning of the
+                # two, so it wins the row colour when both apply.
+                if row.get("blocked_ahead"):
+                    return ["background-color: #f8d7da; color: #000000"] * len(row)
                 if row.get("at_key_level"):
                     return ["background-color: #fff3b0; color: #000000"] * len(row)
                 return [""] * len(row)
 
             styled = display.style.format(price_cols, na_rep="")
-            if "at_key_level" in display.columns:
-                styled = styled.apply(_highlight_key_level, axis=1)
+            if "at_key_level" in display.columns or "blocked_ahead" in display.columns:
+                styled = styled.apply(_highlight_row, axis=1)
 
             st.dataframe(styled, use_container_width=True, hide_index=True)
 
@@ -370,20 +393,24 @@ def _page_scanner(
 |--------|-------------|
 | pair | Currency pair (e.g. EUR/USD) |
 | trade_signal | Overall signal: STRONG_BUY, BUY_CANDIDATE, SHORT_CANDIDATE, STRONG_SHORT, WATCH_ONLY, AVOID |
-| total_score | Combined score (base 0–100 + MTF 0–30 + S/R 0–25 + strength ±10) |
+| total_score | Combined score (momentum/reversion 0–40 + session 0–20 + MTF 0–30 + S/R −25…+25 + strength ±10) |
+| model_prob | Trained model's P(target before stop). Blank until a model is activated |
+| required_prob | Cost-adjusted breakeven win rate + margin. A signal must clear this to stay actionable |
 | regime | ADX-based: TREND (momentum weighted), RANGE (reversion weighted), MIXED, UNKNOWN |
 | momentum_score | EMA/MACD/RSI momentum component (0–40), weighted by regime |
 | reversion_score | RSI extreme/Bollinger Band component (0–40), weighted by regime |
 | session_score | Session quality/breakout component (0–20) |
-| suggested_entry / stop / target | ATR-based levels (stop 1.0×ATR, target 1.5×ATR) |
+| suggested_entry / stop / target | ATR-based levels (stop max of 1.5×ATR, 8 pips, 8× spread; target 1.5× the stop) |
 | stop_pips / target_pips / rr_ratio | Risk in pips, reward in pips, reward:risk (1.5) |
+| cost_ratio | Spread as a fraction of the stop. Above 15% the setup is vetoed — cost outruns any edge |
 | adx14 | Trend strength: >25 trending, <18 ranging |
-| mtf_score | Multi-timeframe confluence bonus (0=NONE, 15=PARTIAL, 30=FULL) |
-| mtf_confluence | FULL=all 3 TFs agree, PARTIAL=2 agree, NONE=conflict |
+| mtf_score | Higher-timeframe confirmation bonus (0=none, 15=PARTIAL, 30=FULL) |
+| mtf_confluence | FULL=H1 and H4 both agree, PARTIAL=one agrees and the other is flat, UNCONFIRMED=both flat, CONFLICT/OPPOSED=they disagree |
 | h1_direction | H1 trend direction (LONG/SHORT/NEUTRAL) |
 | h4_direction | H4 trend direction (LONG/SHORT/NEUTRAL) |
-| sr_score | Support/Resistance proximity bonus (0–25) |
-| at_key_level | Price is AT a key S/R level (highlighted row) |
+| sr_score | Structure relative to the trade: +25 entering at a level behind you, −25 when one blocks the path ahead |
+| at_key_level | Entry sits at favourable structure — support for a long, resistance for a short (yellow row) |
+| blocked_ahead | A level sits within 1×ATR of the path to target, so the move is unlikely to complete (red row) |
 | nearest_support | Closest support level below current price |
 | nearest_resistance | Closest resistance level above current price |
 | strength_assessment | Currency strength: STRONG_BASE_WEAK_QUOTE / WEAK_BASE_STRONG_QUOTE / NEUTRAL |
@@ -556,11 +583,254 @@ def _page_scanner(
                 tdf = pd.DataFrame(open_tracked)
                 tdf["pair"] = tdf["pair"].apply(format_pair)
                 keep = [c for c in [
-                    "pair", "signal", "entry_price", "stop_price", "target_price",
-                    "stop_pips", "target_pips", "entry_ts", "created_at",
+                    "pair", "signal", "model_prob", "required_prob", "total_score",
+                    "entry_price", "stop_price", "target_price",
+                    "stop_pips", "target_pips", "cost_ratio", "spread_pips",
+                    "session", "regime", "entry_ts", "created_at",
                 ] if c in tdf.columns]
                 st.dataframe(tdf[keep], use_container_width=True, hide_index=True)
                 st.caption("Each scan checks these against their ATR stop/target; a touch records a WIN/LOSS outcome.")
+
+    # ── Model tab ────────────────────────────────────────────────────────────
+    with tab_model:
+        st.subheader("Direction Model")
+        st.caption(
+            "The rules-based score proposes a setup; this model decides whether the "
+            "measured odds justify paying the spread. Until one is trained and "
+            "activated, the scanner runs rules-only and simply logs features."
+        )
+
+        training_rows = storage.load_training_rows(feature_version=FEATURE_VERSION)
+        open_n = len(storage.load_tracked_signals("open"))
+        needed = max(0, MIN_TRAIN_SAMPLES - len(training_rows))
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Trainable trades", len(training_rows))
+        c2.metric("Awaiting resolution", open_n)
+        c3.metric("Needed to train", needed if needed else "ready")
+
+        if needed:
+            st.progress(min(1.0, len(training_rows) / MIN_TRAIN_SAMPLES))
+            st.info(
+                f"{needed} more resolved trades needed before the first train "
+                f"(minimum {MIN_TRAIN_SAMPLES}). Every actionable signal now stores its "
+                "feature vector, so this fills up as signals resolve."
+            )
+
+        models = storage.load_models()
+        active = next((m for m in models if m["is_active"]), None)
+
+        if not models:
+            st.warning("No model trained yet — the scanner is running rules-only.")
+        elif active:
+            a1, a2, a3, a4 = st.columns(4)
+            a1.metric("OOS AUC", f"{active['auc']:.4f}" if active["auc"] else "—")
+            a2.metric("Top-decile precision",
+                      f"{active['top_decile_prec']:.3f}" if active["top_decile_prec"] else "—")
+            a3.metric("Brier", f"{active['brier']:.4f}" if active["brier"] else "—")
+            a4.metric("Trained on", active["n_train"] or "—")
+            st.success(f"Model #{active['id']} is active — signals are being probability-gated.")
+            if active["auc"] is not None and active["auc"] < 0.53:
+                st.warning(
+                    f"Active model's out-of-sample AUC is {active['auc']:.4f} — "
+                    "close to the 0.50 no-skill line. Treat its vetoes as weak evidence."
+                )
+        else:
+            st.info("Models exist but none is active. The scanner is running rules-only.")
+
+        # ── When to retrain ─────────────────────────────────────────────────
+        with st.expander("When to retrain, and how to read the result"):
+            st.markdown(f"""
+**Required**
+
+- The first time you cross **{MIN_TRAIN_SAMPLES}** resolved trades.
+- After editing `FEATURE_NAMES` in `forex/features.py` — bump `FEATURE_VERSION` and the
+  scanner ignores the stale model (fails closed) until you retrain.
+- After changing `_RR`, `_STOP_ATR_MULT`, `_MIN_STOP_PIPS` or `_SPREAD_STOP_MULT` in
+  `forex/signals.py`. Those change the stop/target geometry, so older labels describe a
+  different bracket and the model would be fitting the wrong thing.
+
+**Worth doing**
+
+- Every ~50–100 newly resolved trades once past the first train.
+- If the realised win rate on gated trades sits below the model's predicted rate for
+  several weeks — that is calibration drift.
+
+**Don't** retrain on a handful of new rows. With ~29 features you would be chasing
+noise, and each retrain shifts the veto threshold under your live signals.
+
+---
+
+**Reading the result — three numbers, in priority order**
+
+1. **Pooled OOS AUC** — 0.50 is no skill. Below ~0.53 the model has nothing and its
+   vetoes are noise. This is the pass/fail.
+2. **Expectancy at the decision threshold** — the money number. AUC can look
+   respectable while expectancy stays negative. Compare the gated rows against the
+   ungated baseline; if gating does not beat it, the model is not earning its keep.
+3. **Calibration** — predicted vs actual should track. If it predicts 0.60 and delivers
+   0.40, the probability gate is comparing against a breakeven number that means
+   nothing, even with good AUC.
+
+The gate enforces (1) and (2) automatically. Check (3) yourself — it is the one that
+can be quietly wrong.
+
+Also watch **fold AUC std dev**. One fold at 0.78 and the rest near 0.52 is a model
+fitted to one regime, not an edge — more informative than the pooled number at this
+sample size.
+
+> Your effective sample is smaller than the row count: simultaneous longs across
+> EUR/GBP/AUD/NZD are largely one USD bet. Treat a first-train AUC of 0.53–0.58 as
+> encouraging but provisional.
+""")
+
+        # ── Retrain ─────────────────────────────────────────────────────────
+        st.markdown("### Retrain")
+        ready = len(training_rows) >= MIN_TRAIN_SAMPLES
+
+        with st.expander("Advanced settings"):
+            adv1, adv2, adv3 = st.columns(3)
+            l2 = adv1.number_input("L2 penalty", 0.01, 100.0, 1.0, step=0.5,
+                                   help="Higher = more shrinkage. Raise if coefficients "
+                                        "swing wildly between folds.")
+            folds = adv2.number_input("Walk-forward folds", 2, 12, 5, step=1)
+            min_auc = adv3.number_input("Minimum AUC to pass", 0.50, 0.80, 0.53, step=0.01)
+            notes = st.text_input("Note stored with the model", "",
+                                  placeholder="e.g. after widening stops")
+
+        if st.button("Run Retrain", type="primary", disabled=not ready,
+                     help=None if ready else
+                     f"Needs {MIN_TRAIN_SAMPLES} resolved trades; you have {len(training_rows)}."):
+            with st.spinner("Walk-forward evaluating and fitting…"):
+                try:
+                    report = evaluate_and_fit(storage, l2=float(l2), folds=int(folds),
+                                              min_auc=float(min_auc))
+                    if report["error"]:
+                        st.session_state.model_report = None
+                        st.error(report["error"])
+                    else:
+                        # Saved inactive — promotion is a separate, deliberate click.
+                        new_id = save_candidate(storage, report, notes=notes)
+                        st.session_state.model_report = {
+                            "id": new_id,
+                            "passes": report["passes"],
+                            "summary": gate_summary(report),
+                            "metrics": report["metrics"],
+                            "gated": report["gated"],
+                            "calibration": report["calibration"],
+                            "folds": report["folds"],
+                            "coefficients": report["coefficients"],
+                            "baseline": report["baseline_expectancy_r"],
+                            "fold_auc_std": report["fold_auc_std"],
+                        }
+                except Exception as exc:
+                    st.session_state.model_report = None
+                    st.error(f"Retrain failed: {exc}")
+
+        # ── Candidate review + promote ──────────────────────────────────────
+        rep = st.session_state.get("model_report")
+        if rep:
+            st.markdown("---")
+            st.markdown(f"### Candidate model #{rep['id']}")
+            if rep["passes"]:
+                st.success(rep["summary"])
+            else:
+                st.error(rep["summary"])
+
+            m = rep["metrics"]
+            r1, r2, r3, r4 = st.columns(4)
+            r1.metric("OOS AUC", f"{m['auc']:.4f}" if m["auc"] is not None else "—",
+                      delta=f"{m['auc'] - 0.5:+.4f} vs no-skill" if m["auc"] is not None else None)
+            r2.metric("Fold AUC std", f"{rep['fold_auc_std']:.4f}" if rep["fold_auc_std"] else "—")
+            r3.metric("Top-decile prec",
+                      f"{m['top_decile_prec']:.3f}" if m["top_decile_prec"] is not None else "—")
+            r4.metric("Brier", f"{m['brier']:.4f}" if m["brier"] is not None else "—")
+
+            st.markdown("**Expectancy at each decision threshold** "
+                        f"(ungated baseline: `{rep['baseline']:+.4f}R`)")
+            gdf = pd.DataFrame(rep["gated"])
+            if not gdf.empty:
+                gdf = gdf.rename(columns={
+                    "threshold": "P(win) >=", "trades_taken": "Taken",
+                    "trades_available": "Available", "selectivity": "Selectivity",
+                    "expectancy_r": "Expectancy (R)", "total_r": "Total (R)",
+                })
+                keep = [c for c in ["P(win) >=", "Taken", "Available", "Selectivity",
+                                    "Expectancy (R)", "Total (R)"] if c in gdf.columns]
+                st.dataframe(gdf[keep], use_container_width=True, hide_index=True)
+
+            cc1, cc2 = st.columns(2)
+            with cc1:
+                st.markdown("**Calibration** (predicted vs actual)")
+                cdf = pd.DataFrame(rep["calibration"])
+                if not cdf.empty:
+                    st.dataframe(cdf, use_container_width=True, hide_index=True)
+                    st.caption("These two columns should track each other.")
+            with cc2:
+                st.markdown("**Per-fold stability**")
+                fdf2 = pd.DataFrame(rep["folds"])
+                if not fdf2.empty:
+                    st.dataframe(fdf2, use_container_width=True, hide_index=True)
+                    st.caption("One strong fold among weak ones = regime-fitted, not an edge.")
+
+            with st.expander("Largest standardised coefficients (what carries the edge)"):
+                st.dataframe(
+                    pd.DataFrame(rep["coefficients"], columns=["feature", "coefficient"]),
+                    use_container_width=True, hide_index=True,
+                )
+
+            st.markdown("#### Promote")
+            if rep["passes"]:
+                st.caption("This model clears the gate. Promoting makes it veto live signals "
+                           "on the next scan.")
+                if st.button(f"Promote model #{rep['id']} to active", type="primary"):
+                    if storage.activate_model(rep["id"]):
+                        st.success(f"Model #{rep['id']} is now active.")
+                        st.session_state.model_report = None
+                        st.rerun()
+                    else:
+                        st.error("Could not activate — model id not found.")
+            else:
+                st.warning(
+                    "This model failed the quality gate. Promoting it would let a model "
+                    "with no demonstrated edge suppress real setups. The usual answer is "
+                    "to collect more resolved trades and retrain."
+                )
+                override = st.checkbox("I understand, promote it anyway")
+                if st.button(f"Force-promote model #{rep['id']}", disabled=not override):
+                    if storage.activate_model(rep["id"]):
+                        st.warning(f"Model #{rep['id']} force-promoted despite failing the gate.")
+                        st.session_state.model_report = None
+                        st.rerun()
+
+        # ── History / rollback ──────────────────────────────────────────────
+        if models:
+            st.markdown("---")
+            st.markdown("### Model history")
+            st.dataframe(pd.DataFrame(models), use_container_width=True, hide_index=True)
+
+            h1, h2 = st.columns([3, 1])
+            options = [m["id"] for m in models]
+            pick = h1.selectbox(
+                "Roll back to a previous model", options,
+                format_func=lambda i: (
+                    f"#{i}" + (" (active)" if any(m["id"] == i and m["is_active"] for m in models) else "")
+                ),
+            )
+            if h2.button("Activate", key="rollback_activate"):
+                if storage.activate_model(int(pick)):
+                    st.success(f"Model #{pick} is now active.")
+                    st.rerun()
+
+            if active and st.button("Disable model (revert to rules-only)"):
+                storage.deactivate_all_models()
+                st.info("All models deactivated — the scanner is rules-only again.")
+                st.rerun()
+
+        st.caption(
+            "Equivalent CLI, if you prefer it: `python scripts/train_model.py` to evaluate, "
+            "`--activate` to promote in one step."
+        )
 
     # ── Scan Logs tab ─────────────────────────────────────────────────────────
     with tab_logs:

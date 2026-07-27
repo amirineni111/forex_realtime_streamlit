@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import List, Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 
 class ForexBar(BaseModel):
@@ -23,6 +23,10 @@ class ForexQuote(BaseModel):
 
 
 class ForexSnapshot(BaseModel):
+    # `model_prob` is a legitimate field name here; opt out of pydantic's
+    # "model_" protected-namespace warning rather than renaming it.
+    model_config = ConfigDict(protected_namespaces=())
+
     pair: str
     bid: Optional[float] = None
     ask: Optional[float] = None
@@ -80,6 +84,11 @@ class ForexSnapshot(BaseModel):
     base_strength: Optional[float] = None
     quote_strength: Optional[float] = None
     strength_assessment: Optional[str] = None
+    # Structure / cost / model gating
+    blocked_ahead: bool = False
+    cost_ratio: Optional[float] = None
+    model_prob: Optional[float] = None
+    required_prob: Optional[float] = None
 
 
 class ScanRequest(BaseModel):

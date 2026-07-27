@@ -194,27 +194,34 @@ def _session_breakout(
 
 
 def _mtf_confluence(
-    m5_dir: Optional[str],
+    dominant: Optional[str],
     h1_dir: Optional[str],
     h4_dir: Optional[str],
 ) -> Tuple[float, str]:
     """
-    Score multi-timeframe alignment.
-    Full (all 3 agree): +30 pts, "FULL"
-    Two of three agree: +15 pts, "PARTIAL"
-    Conflict/missing: 0 pts, "NONE"
+    Score higher-timeframe confirmation of the M5 ``dominant`` direction.
+
+    The M5 direction is the thing being confirmed — it is NOT a vote. It used to be
+    passed in as one of three votes, so a setup whose higher timeframes were both
+    NEUTRAL scored "FULL" (+30 pts) purely on its own say-so: 103 of 143 historical
+    FULL rows had a NEUTRAL/absent higher timeframe, and 20 had *both* neutral.
+    Those 30 free points are most of what let a mediocre setup clear the 70-point
+    STRONG threshold, which is why the STRONG tier never outperformed.
+
+    FULL now requires both H1 and H4 present and agreeing.
     """
-    dirs = [d for d in (m5_dir, h1_dir, h4_dir) if d and d != "NEUTRAL"]
-    if not dirs:
+    if dominant not in ("LONG", "SHORT"):
         return 0.0, "NONE"
-    long_count = dirs.count("LONG")
-    short_count = dirs.count("SHORT")
-    total = len(dirs)
-    if long_count == total or short_count == total:
-        return 30.0, "FULL"
-    elif long_count >= 2 or short_count >= 2:
-        return 15.0, "PARTIAL"
-    return 0.0, "NONE"
+
+    votes = [d for d in (h1_dir, h4_dir) if d in ("LONG", "SHORT")]
+    if not votes:
+        return 0.0, "UNCONFIRMED"
+
+    agree = sum(1 for v in votes if v == dominant)
+    oppose = len(votes) - agree
+    if oppose:
+        return 0.0, "OPPOSED" if agree == 0 else "CONFLICT"
+    return (30.0, "FULL") if len(votes) == 2 else (15.0, "PARTIAL")
 
 
 def _sr_proximity(
@@ -222,13 +229,25 @@ def _sr_proximity(
     atr14: Optional[float],
     sr_levels: list,
     dominant_direction: str,
-) -> Tuple[float, str, bool, Optional[float], Optional[float]]:
+) -> Tuple[float, str, bool, bool, Optional[float], Optional[float]]:
     """
-    Score proximity to key S/R levels.
-    Returns (score, reason, at_key_level, nearest_support, nearest_resistance).
+    Score structure *relative to the trade direction*.
+
+    A level only helps when it sits **behind** the trade (support beneath a long,
+    resistance above a short) — that is where the stop shelters. A level directly
+    **ahead** is a wall: it caps the move before the target can be reached.
+
+    The previous version was direction-blind — both the `dist <= 0.3` branches
+    awarded +25 and set at_key_level regardless of which way the trade pointed, so
+    a long pinned under resistance scored identically to a long bouncing off
+    support. Combined with the MTF bug this manufactured the STRONG tier: 10 of 11
+    historical STRONG_BUY rows were at_key_level with an average sr_score of 24.1.
+
+    Returns (score, reason, at_key_level, blocked_ahead, nearest_support, nearest_resistance).
+    ``score`` may be negative when structure opposes the trade.
     """
-    if not sr_levels or not close or not atr14 or atr14 == 0:
-        return 0.0, "", False, None, None
+    if not sr_levels or not close or not atr14 or atr14 <= 0:
+        return 0.0, "", False, False, None, None
 
     supports = [lv["price"] for lv in sr_levels if lv["type"] == "S" and lv["price"] <= close]
     resistances = [lv["price"] for lv in sr_levels if lv["type"] == "R" and lv["price"] >= close]
@@ -236,31 +255,51 @@ def _sr_proximity(
     nearest_support = max(supports) if supports else None
     nearest_resistance = min(resistances) if resistances else None
 
+    if dominant_direction not in ("LONG", "SHORT"):
+        return 0.0, "", False, False, nearest_support, nearest_resistance
+
+    if dominant_direction == "LONG":
+        behind, ahead = nearest_support, nearest_resistance
+        behind_label, ahead_label = "support", "resistance"
+    else:
+        behind, ahead = nearest_resistance, nearest_support
+        behind_label, ahead_label = "resistance", "support"
+
     score = 0.0
     reasons: List[str] = []
     at_key_level = False
+    blocked_ahead = False
 
-    if nearest_support is not None:
-        dist = (close - nearest_support) / atr14
+    if behind is not None:
+        dist = abs(close - behind) / atr14
         if dist <= 0.3:
             score += 25
             at_key_level = True
-            reasons.append(f"AT support {nearest_support:.5f}")
-        elif dist <= 1.0 and dominant_direction == "LONG":
+            reasons.append(f"AT {behind_label} {behind:.5f} (entry at structure)")
+        elif dist <= 1.0:
             score += 15
-            reasons.append(f"Near support {nearest_support:.5f}")
+            reasons.append(f"Near {behind_label} {behind:.5f}")
 
-    if nearest_resistance is not None:
-        dist = (nearest_resistance - close) / atr14
-        if dist <= 0.3:
-            score += 25
-            at_key_level = True
-            reasons.append(f"AT resistance {nearest_resistance:.5f}")
-        elif dist <= 1.0 and dominant_direction == "SHORT":
-            score += 15
-            reasons.append(f"Near resistance {nearest_resistance:.5f}")
+    if ahead is not None:
+        dist = abs(ahead - close) / atr14
+        # Target sits ~2.25×ATR out (1.5×RR on a 1.5×ATR stop), so a level inside
+        # 1×ATR means the trade is very unlikely to reach target unimpeded.
+        if dist <= 1.0:
+            score -= 25
+            blocked_ahead = True
+            reasons.append(f"BLOCKED by {ahead_label} {ahead:.5f} ({dist:.1f}×ATR ahead)")
+        elif dist <= 1.5:
+            score -= 10
+            reasons.append(f"{ahead_label.capitalize()} {ahead:.5f} close ahead ({dist:.1f}×ATR)")
 
-    return round(min(score, 25), 1), "; ".join(reasons), at_key_level, nearest_support, nearest_resistance
+    return (
+        round(max(-25.0, min(score, 25.0)), 1),
+        "; ".join(reasons),
+        at_key_level,
+        blocked_ahead,
+        nearest_support,
+        nearest_resistance,
+    )
 
 
 # Regime thresholds on ADX: above TREND → momentum playbook, below RANGE → reversion.
@@ -274,7 +313,31 @@ _RR = 1.5
 # Noise floor for the stop: 1×ATR on M5 is often just 2-4 pips, which sits inside
 # ordinary spread noise and gets tagged within minutes. Never risk less than this.
 _MIN_STOP_PIPS = 8.0
-_SPREAD_STOP_MULT = 4.0  # stop must also be ≥ 4× the current spread
+
+# Transaction cost is the dominant term at this timeframe. Measured over 910
+# recorded outcomes: an average 2.23-pip spread against a 9.39-pip stop burned
+# 0.237R per round trip — more than any plausible edge in the score. The stop must
+# therefore scale with the spread so the cost ratio stays bounded.
+_SPREAD_STOP_MULT = 8.0   # stop ≥ 8× spread ⇒ cost ≤ 12.5% of risk
+_MAX_COST_RATIO = 0.15    # hard veto above this; nothing actionable survives it
+
+# How far above cost-adjusted breakeven a modelled probability must sit before the
+# trade is worth taking. Trading at exactly breakeven just donates the spread to
+# the broker while adding variance, so demand a real cushion.
+_PROB_MARGIN = 0.04
+
+
+def breakeven_win_rate(rr: float = _RR, cost_ratio: float = 0.0) -> float:
+    """
+    Win rate at which a bracket exactly breaks even, including round-trip cost.
+
+    expectancy = p·(rr − c) − (1 − p)·(1 + c) = 0  ⇒  p = (1 + c) / (1 + rr)
+
+    with everything expressed in units of the stop distance. At rr=1.5 and zero
+    cost this is exactly 0.400 — which is why an edgeless system lands on ~40%
+    and why the observed 39.56% was indistinguishable from random entry.
+    """
+    return (1.0 + cost_ratio) / (1.0 + rr)
 
 
 def _regime_weights(adx14: Optional[float]) -> Tuple[float, float, str]:
@@ -337,10 +400,17 @@ def score_pair(
     h1_direction: Optional[str] = None,
     h4_direction: Optional[str] = None,
     sr_levels: Optional[list] = None,
+    model_prob: Optional[float] = None,
+    strength_bonus: float = 0.0,
 ) -> dict:
     """
     Compute all signal scores and produce final trade_signal.
     Returns a dict merging into ForexSnapshot.
+
+    ``model_prob`` is the trained model's P(target before stop) for this setup, when
+    one is available. It acts as a veto, never as a promoter: the rule-based score
+    still has to propose the setup, and the model decides whether the measured odds
+    justify paying the spread.
     """
     close = indicators.get("close")
     rsi14 = indicators.get("rsi14")
@@ -355,6 +425,8 @@ def score_pair(
     bb_middle = indicators.get("bb_middle")
     session_high = indicators.get("session_high")
     session_low = indicators.get("session_low")
+
+    entry_px = round((bid + ask) / 2, 6) if bid and ask else close
 
     risk_notes = []
     if spread_pips is not None and spread_pips > max_spread_pips:
@@ -385,19 +457,40 @@ def score_pair(
         "SHORT" if short_w > long_w else "NEUTRAL"
     )
 
-    # MTF confluence bonus (0-30 pts)
+    # MTF confluence bonus (0-30 pts) — requires real higher-timeframe confirmation
     mtf_bonus, mtf_confluence = _mtf_confluence(dominant, h1_direction, h4_direction)
 
-    # S/R proximity bonus (0-25 pts)
-    sr_bonus, sr_reason, at_key_level, nearest_support, nearest_resistance = _sr_proximity(
-        close, atr14, sr_levels or [], dominant
-    )
+    # S/R structure, direction-aware (-25 to +25 pts)
+    (
+        sr_bonus, sr_reason, at_key_level, blocked_ahead,
+        nearest_support, nearest_resistance,
+    ) = _sr_proximity(close, atr14, sr_levels or [], dominant)
 
-    total = mom_score + rev_score + sess_score + mtf_bonus + sr_bonus
+    # Currency-strength alignment is folded in here rather than bolted onto
+    # total_score after the fact, so the score that drives the decision, the score
+    # shown on the dashboard, and the score the model is trained on are the same number.
+    total = mom_score + rev_score + sess_score + mtf_bonus + sr_bonus + strength_bonus
 
     # Penalize spread
     if spread_pips is not None and spread_pips > max_spread_pips:
         total = max(0, total - 20)
+
+    # Cost ratio: spread as a fraction of the risk being taken. Computed from the
+    # stop we would actually use, so it reflects the real drag on expectancy.
+    provisional = _trade_levels(dominant, entry_px, atr14, pair, spread_pips)
+    prov_stop_pips = provisional.get("stop_pips") or 0.0
+    cost_ratio = round(spread_pips / prov_stop_pips, 4) if (
+        spread_pips is not None and prov_stop_pips > 0
+    ) else None
+    cost_veto = cost_ratio is not None and cost_ratio > _MAX_COST_RATIO
+    if cost_veto:
+        risk_notes.append(
+            f"Cost {cost_ratio:.0%} of risk (spread {spread_pips:.1f}p vs "
+            f"{prov_stop_pips:.0f}p stop) — above {_MAX_COST_RATIO:.0%} limit"
+        )
+    ahead_block_label = "resistance" if dominant == "LONG" else "support"
+    if blocked_ahead:
+        risk_notes.append(f"Nearby {ahead_block_label} blocks the path to target")
 
     # H1 alignment gate: forward-tested outcomes showed candidates firing against the
     # H1 trend were the biggest loss bucket. An actionable signal must not fight H1.
@@ -407,12 +500,31 @@ def score_pair(
         and h1_direction != dominant
     )
 
+    # Probability gate. When a trained model is available, an actionable signal must
+    # clear the cost-adjusted breakeven win rate by a margin — this is the whole
+    # point of the learning loop: the score proposes, the measured model disposes.
+    be_p = breakeven_win_rate(_RR, cost_ratio or 0.0)
+    required_p = round(be_p + _PROB_MARGIN, 4)
+    prob_veto = model_prob is not None and model_prob < required_p
+
     if spread_pips is not None and spread_pips > max_spread_pips * 2:
         trade_signal = "AVOID"
         reason = f"Spread too wide ({spread_pips:.1f} pips)"
+    elif cost_veto:
+        trade_signal = "AVOID"
+        reason = f"Cost {cost_ratio:.0%} of risk exceeds {_MAX_COST_RATIO:.0%} limit"
     elif h1_opposes and total >= 45:
         trade_signal = "WATCH_ONLY"
         reason = f"{dominant} setup ({total:.0f}pts) but H1 trend is {h1_direction} — countertrend"
+    elif blocked_ahead and total >= 45:
+        trade_signal = "WATCH_ONLY"
+        reason = f"{dominant} setup ({total:.0f}pts) but {ahead_block_label} blocks the target"
+    elif prob_veto and total >= 45:
+        trade_signal = "WATCH_ONLY"
+        reason = (
+            f"{dominant} setup ({total:.0f}pts) but model P(win)={model_prob:.0%} "
+            f"< {required_p:.0%} required"
+        )
     elif total >= 70 and dominant == "LONG" and mtf_bonus >= 15:
         trade_signal = "STRONG_BUY"
         reason = f"Strong long setup ({total:.0f}pts, MTF:{mtf_confluence})"
@@ -432,15 +544,14 @@ def score_pair(
         trade_signal = "AVOID"
         reason = f"No clear setup ({total:.0f}pts)"
 
+    if model_prob is not None and trade_signal not in ("AVOID", "WATCH_ONLY"):
+        reason += f" — P(win) {model_prob:.0%} vs {required_p:.0%} needed"
+
     # ATR-based stop/target/RR for actionable directions
-    entry = round((bid + ask) / 2, 6) if bid and ask else close
+    entry = entry_px
     levels = _trade_levels(dominant, entry, atr14, pair, spread_pips) if trade_signal not in (
         "AVOID", "WATCH_ONLY"
     ) else {}
-    if levels and spread_pips is not None and levels["target_pips"] < spread_pips * 3:
-        risk_notes.append(
-            f"Target {levels['target_pips']:.1f}p < 3× spread — thin edge"
-        )
 
     signal_parts = []
     if mom_reason:
@@ -470,9 +581,18 @@ def score_pair(
         "mtf_confluence": mtf_confluence,
         "sr_score": sr_bonus,
         "at_key_level": at_key_level,
+        "blocked_ahead": blocked_ahead,
         "nearest_support": nearest_support,
         "nearest_resistance": nearest_resistance,
         "sr_levels_json": json.dumps(sr_levels[:5]) if sr_levels else None,
+        "cost_ratio": cost_ratio,
+        "model_prob": model_prob,
+        "required_prob": required_p,
+        "dominant": dominant,
+        # Levels the trade *would* use, exposed even when the signal is not actionable
+        # so feature extraction always sees a real stop size rather than a zero.
+        "prov_stop_pips": provisional.get("stop_pips"),
+        "prov_target_pips": provisional.get("target_pips"),
         "total_score": round(total, 1),
         "trade_signal": trade_signal,
         "signal_reason": reason,
