@@ -170,6 +170,64 @@ class Storage:
                     is_active        INTEGER DEFAULT 0,
                     notes            TEXT
                 );
+
+                -- Local mirror of the daily end-of-day ML predictions produced by
+                -- the sqlserver_copilot_forex repo. Mirrored rather than queried
+                -- live because the source changes once per weekday while this
+                -- dashboard refreshes every minute.
+                CREATE TABLE IF NOT EXISTS ml_predictions (
+                    prediction_date   TEXT NOT NULL,  -- close the prediction was made FROM
+                    pair              TEXT NOT NULL,  -- OANDA form, e.g. EUR_USD
+                    sql_pair          TEXT,           -- source form, e.g. EURUSD
+                    target_date       TEXT,           -- session the prediction is FOR
+                    predicted_signal  TEXT,           -- BUY / SELL / HOLD(=abstain)
+                    signal_confidence REAL,
+                    prob_buy          REAL,
+                    prob_sell         REAL,
+                    prob_hold         REAL,
+                    base_close        REAL,           -- source close at prediction_date
+                    model_name        TEXT,
+                    model_version     TEXT,
+                    source_created_at TEXT,
+                    synced_at         TEXT DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (prediction_date, pair)
+                );
+
+                -- Every attempt to reach SQL Server / OANDA for ML data, including
+                -- failures. Throttling reads this: without logging failures, an
+                -- unreachable server would be dialled on every 60s refresh.
+                CREATE TABLE IF NOT EXISTS ml_sync_log (
+                    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                    kind                TEXT,
+                    attempted_at        TEXT DEFAULT CURRENT_TIMESTAMP,
+                    status              TEXT,
+                    rows_synced         INTEGER,
+                    max_prediction_date TEXT,
+                    message             TEXT
+                );
+
+                -- One scored prediction per (session, pair), evaluated at the
+                -- 17:00 ET New York close against OANDA daily candles.
+                CREATE TABLE IF NOT EXISTS ml_reconciliation (
+                    target_date       TEXT NOT NULL,
+                    pair              TEXT NOT NULL,
+                    prediction_date   TEXT,
+                    predicted_signal  TEXT,
+                    implied_direction TEXT,
+                    signal_confidence REAL,
+                    prob_buy          REAL,
+                    prob_sell         REAL,
+                    sql_base_close    REAL,
+                    base_close        REAL,
+                    actual_close      REAL,
+                    actual_return_pct REAL,
+                    actual_pips       REAL,
+                    actual_direction  TEXT,
+                    signal_outcome    TEXT,   -- HIT / MISS / ABSTAIN
+                    implied_outcome   TEXT,   -- HIT / MISS / N/A
+                    evaluated_at      TEXT DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (target_date, pair)
+                );
             """)
 
         # Additive column migrations, safe to re-run on every startup.
@@ -243,6 +301,10 @@ class Storage:
                     ON forex_trade_outcomes(tracking_id);
                 CREATE INDEX IF NOT EXISTS idx_models_active
                     ON forex_models(is_active, created_at);
+                CREATE INDEX IF NOT EXISTS idx_ml_predictions_target
+                    ON ml_predictions(target_date);
+                CREATE INDEX IF NOT EXISTS idx_ml_sync_log_kind
+                    ON ml_sync_log(kind, attempted_at);
             """)
 
     # ── Scan run lifecycle ──────────────────────────────────────────────────
@@ -783,5 +845,191 @@ class Storage:
                 "SELECT id,created_at,algo,feature_version,n_train,n_test,auc,brier,"
                 "top_decile_prec,base_rate,is_active,notes "
                 "FROM forex_models ORDER BY created_at DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ── Daily ML predictions (SQL Server mirror) ────────────────────────────
+
+    _ML_PREDICTION_COLS = (
+        "prediction_date", "pair", "sql_pair", "target_date", "predicted_signal",
+        "signal_confidence", "prob_buy", "prob_sell", "prob_hold", "base_close",
+        "model_name", "model_version", "source_created_at",
+    )
+
+    def save_ml_predictions(self, rows: List[dict]) -> int:
+        """
+        Upsert mirrored prediction rows, keyed on (prediction_date, pair).
+
+        REPLACE rather than IGNORE so a re-run of the daily job upstream
+        corrects the mirror instead of leaving a stale signal on screen.
+        """
+        if not rows:
+            return 0
+        placeholders = ",".join("?" * len(self._ML_PREDICTION_COLS))
+        payload = [
+            tuple(r.get(col) for col in self._ML_PREDICTION_COLS) for r in rows
+        ]
+        with self._connect() as conn:
+            conn.executemany(
+                f"INSERT OR REPLACE INTO ml_predictions "
+                f"({','.join(self._ML_PREDICTION_COLS)}, synced_at) "
+                f"VALUES ({placeholders}, CURRENT_TIMESTAMP)",
+                payload,
+            )
+        return len(payload)
+
+    def load_ml_max_prediction_date(self) -> Optional[str]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT MAX(prediction_date) AS d FROM ml_predictions"
+            ).fetchone()
+        return row["d"] if row and row["d"] else None
+
+    def load_ml_latest_predictions(self) -> list:
+        """The newest mirrored run — what the home-page box displays."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM ml_predictions WHERE prediction_date = "
+                "(SELECT MAX(prediction_date) FROM ml_predictions) ORDER BY pair"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def load_ml_predictions_for_target(self, target_date: str) -> list:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM ml_predictions WHERE target_date = ? ORDER BY pair",
+                (target_date,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def load_ml_target_dates(self, limit: int = 60) -> list:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT target_date FROM ml_predictions "
+                "WHERE target_date IS NOT NULL ORDER BY target_date DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [r["target_date"] for r in rows]
+
+    def log_ml_sync(
+        self, kind: str, status: str, rows_synced: int,
+        max_prediction_date: Optional[str], message: str = "",
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO ml_sync_log "
+                "(kind,status,rows_synced,max_prediction_date,message) VALUES (?,?,?,?,?)",
+                (kind, status, rows_synced, max_prediction_date, message),
+            )
+            # Bounded log — this table is written on a schedule, never read in bulk.
+            conn.execute(
+                "DELETE FROM ml_sync_log WHERE id NOT IN "
+                "(SELECT id FROM ml_sync_log ORDER BY id DESC LIMIT 200)"
+            )
+
+    def load_ml_last_sync(self, kind: Optional[str] = None) -> Optional[dict]:
+        sql = "SELECT * FROM ml_sync_log"
+        params: list = []
+        if kind:
+            sql += " WHERE kind = ?"
+            params.append(kind)
+        sql += " ORDER BY id DESC LIMIT 1"
+        with self._connect() as conn:
+            row = conn.execute(sql, params).fetchone()
+        return dict(row) if row else None
+
+    def load_ml_sync_log(self, limit: int = 25) -> list:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM ml_sync_log ORDER BY id DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ── ML reconciliation ───────────────────────────────────────────────────
+
+    _ML_RECON_COLS = (
+        "target_date", "pair", "prediction_date", "predicted_signal",
+        "implied_direction", "signal_confidence", "prob_buy", "prob_sell",
+        "sql_base_close", "base_close", "actual_close", "actual_return_pct",
+        "actual_pips", "actual_direction", "signal_outcome", "implied_outcome",
+    )
+
+    def save_ml_reconciliation(self, rows: List[dict]) -> int:
+        if not rows:
+            return 0
+        placeholders = ",".join("?" * len(self._ML_RECON_COLS))
+        payload = [tuple(r.get(col) for col in self._ML_RECON_COLS) for r in rows]
+        with self._connect() as conn:
+            conn.executemany(
+                f"INSERT OR REPLACE INTO ml_reconciliation "
+                f"({','.join(self._ML_RECON_COLS)}, evaluated_at) "
+                f"VALUES ({placeholders}, CURRENT_TIMESTAMP)",
+                payload,
+            )
+        return len(payload)
+
+    def load_ml_reconciled_pairs(self, target_date: str) -> set:
+        """Pairs already scored for a session — the skip-list that keeps OANDA calls at zero."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT pair FROM ml_reconciliation WHERE target_date = ?", (target_date,)
+            ).fetchall()
+        return {r["pair"] for r in rows}
+
+    def load_ml_reconciliation(
+        self, target_date: Optional[str] = None, limit: int = 500,
+    ) -> list:
+        sql = "SELECT * FROM ml_reconciliation"
+        params: list = []
+        if target_date:
+            sql += " WHERE target_date = ?"
+            params.append(target_date)
+        sql += " ORDER BY target_date DESC, pair ASC LIMIT ?"
+        params.append(limit)
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def load_ml_reconciled_dates(self, limit: int = 60) -> list:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT target_date FROM ml_reconciliation "
+                "ORDER BY target_date DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [r["target_date"] for r in rows]
+
+    def load_ml_reconciliation_by_date(self, limit: int = 60) -> list:
+        """
+        Per-session hit rates.
+
+        ``signal_*`` counts only the days the gate actually took a side;
+        ``lean_*`` counts every row via the prob_buy/prob_sell lean, which is the
+        only way HOLD/abstain rows — the bulk of the output — get measured.
+        Rows the broker has no price data for are held out of both.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT target_date, "
+                "       SUM(CASE WHEN signal_outcome <> 'NO_DATA' THEN 1 ELSE 0 END) AS pairs, "
+                "       SUM(CASE WHEN signal_outcome IN ('HIT','MISS') THEN 1 ELSE 0 END) AS signal_calls, "
+                "       SUM(CASE WHEN signal_outcome = 'HIT' THEN 1 ELSE 0 END) AS signal_hits, "
+                "       SUM(CASE WHEN implied_outcome IN ('HIT','MISS') THEN 1 ELSE 0 END) AS lean_calls, "
+                "       SUM(CASE WHEN implied_outcome = 'HIT' THEN 1 ELSE 0 END) AS lean_hits, "
+                "       AVG(actual_return_pct) AS avg_return_pct "
+                "FROM ml_reconciliation GROUP BY target_date "
+                "ORDER BY target_date DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def load_ml_reconciliation_by_pair(self, limit: int = 50) -> list:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT pair, "
+                "       SUM(CASE WHEN signal_outcome <> 'NO_DATA' THEN 1 ELSE 0 END) AS sessions, "
+                "       SUM(CASE WHEN signal_outcome IN ('HIT','MISS') THEN 1 ELSE 0 END) AS signal_calls, "
+                "       SUM(CASE WHEN signal_outcome = 'HIT' THEN 1 ELSE 0 END) AS signal_hits, "
+                "       SUM(CASE WHEN implied_outcome IN ('HIT','MISS') THEN 1 ELSE 0 END) AS lean_calls, "
+                "       SUM(CASE WHEN implied_outcome = 'HIT' THEN 1 ELSE 0 END) AS lean_hits "
+                "FROM ml_reconciliation GROUP BY pair ORDER BY pair LIMIT ?", (limit,)
             ).fetchall()
         return [dict(r) for r in rows]

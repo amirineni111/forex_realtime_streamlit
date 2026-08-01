@@ -1,6 +1,6 @@
 from __future__ import annotations
 import json
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -10,8 +10,14 @@ from streamlit_autorefresh import st_autorefresh
 from forex.config import AppSettings, get_settings
 from forex.features import FEATURE_VERSION
 from forex.market_sessions import current_session, is_forex_market_open, session_badge_color
+from forex.ml_sync import (
+    backfill_reconciliation, expected_prediction_date, implied_direction,
+    last_completed_session_date, reconcile_due, reconcile_session,
+    sync_due, sync_predictions,
+)
 from forex.model import MIN_TRAIN_SAMPLES
 from forex.models import ScanRequest
+from forex.oanda import OandaClient
 from forex.pairs import UNIVERSE_MAP, format_pair
 from forex.scanner import run_scan
 from forex.storage import Storage
@@ -44,6 +50,31 @@ def _save_prefs(d: dict) -> None:
     PREFS_PATH.write_text(json.dumps(d, indent=2))
 
 
+# ── Grid sizing ──────────────────────────────────────────────────────────────
+
+# Streamlit's grid draws a ~38px header and ~35px per row, and defaults to a
+# height that fits about ten rows — anything longer gets an inner scrollbar.
+# Sizing the widget to the data removes that scrollbar; the sidebar setting caps
+# how far a grid may grow before it is allowed to scroll again.
+GRID_HEADER_PX = 38
+GRID_ROW_PX = 35
+DEFAULT_TABLE_ROWS = 20   # covers every built-in universe (All = 20 pairs)
+MIN_TABLE_ROWS = 5
+MAX_TABLE_ROWS = 50
+
+
+def _grid_height(row_count: int, max_rows: int | None = None) -> int:
+    """
+    Pixel height that shows ``row_count`` rows without an inner scrollbar.
+
+    Grows only to the data's own length, so a short table does not leave a band
+    of empty grid below it; past the configured cap the grid scrolls as before.
+    """
+    limit = max_rows or st.session_state.get("table_rows", DEFAULT_TABLE_ROWS)
+    visible = max(1, min(int(row_count or 1), int(limit)))
+    return GRID_HEADER_PX + visible * GRID_ROW_PX
+
+
 # ── Session state init ───────────────────────────────────────────────────────
 
 def _init_state() -> None:
@@ -56,6 +87,7 @@ def _init_state() -> None:
         "refresh_seconds": prefs.get("refresh_seconds", 60),
         "universe_choice": prefs.get("universe_choice", "Majors"),
         "custom_pairs_raw": prefs.get("custom_pairs_raw", ""),
+        "table_rows": prefs.get("table_rows", DEFAULT_TABLE_ROWS),
         "auto_refresh_count_last": 0,
         "quotes_auto_refresh_count_last": 0,
         # Candidate model report, held across reruns so the retrain result survives
@@ -73,12 +105,13 @@ _init_state()
 
 def _build_settings() -> AppSettings:
     env_settings = get_settings()
-    return AppSettings(
-        oanda_api_key=st.session_state.oanda_api_key or env_settings.oanda_api_key,
-        oanda_account_id=st.session_state.oanda_account_id or env_settings.oanda_account_id,
-        oanda_env=st.session_state.oanda_env,
-        db_path=env_settings.db_path,
-    )
+    # Start from the environment so the SQL Server / ML block carries through,
+    # then override only the OANDA fields the sidebar owns.
+    return env_settings.model_copy(update={
+        "oanda_api_key": st.session_state.oanda_api_key or env_settings.oanda_api_key,
+        "oanda_account_id": st.session_state.oanda_account_id or env_settings.oanda_account_id,
+        "oanda_env": st.session_state.oanda_env,
+    })
 
 
 # ── Signal color ─────────────────────────────────────────────────────────────
@@ -95,6 +128,357 @@ SIGNAL_COLORS = {
 
 def _signal_badge(signal: str) -> str:
     return f"{SIGNAL_COLORS.get(signal, '⚫')} {signal}"
+
+
+# ── Daily ML predictions (SQL Server mirror) ─────────────────────────────────
+
+ML_SIGNAL_COLORS = {"BUY": "🟢", "SELL": "🔴", "HOLD": "⚪"}
+_DIRECTION_ARROWS = {"UP": "▲ UP", "DOWN": "▼ DOWN", "FLAT": "= FLAT"}
+
+
+def _ml_signal_badge(signal: str) -> str:
+    signal = (signal or "").upper()
+    return f"{ML_SIGNAL_COLORS.get(signal, '⚫')} {signal or '—'}"
+
+
+def _direction_label(direction) -> str:
+    return _DIRECTION_ARROWS.get(direction, "—")
+
+
+def _outcome_badge(outcome) -> str:
+    return {
+        "HIT": "✅ HIT", "MISS": "❌ MISS", "ABSTAIN": "➖ ABSTAIN",
+        "NO_DATA": "⚠️ NO DATA", "no broker data": "⚠️ NO DATA",
+    }.get(outcome, "—")
+
+
+def _fmt_pct1(value) -> str:
+    try:
+        return f"{value:.2f}%" if value is not None and value == value else ""
+    except (TypeError, ValueError):
+        return ""
+
+
+def _hit_rate(hits, calls) -> str:
+    if not calls:
+        return "—"
+    return f"{hits / calls:.0%} ({int(hits)}/{int(calls)})"
+
+
+def _auto_sync_ml(settings: AppSettings, storage: Storage) -> dict:
+    """
+    Refresh the SQLite mirror if — and only if — it is behind the day's run.
+
+    Called on every dashboard render, including auto-refreshes; the throttle and
+    the up-to-date check live in ``ml_sync`` so the common path never opens a
+    connection to SQL Server.
+    """
+    try:
+        return sync_predictions(storage, settings)
+    except Exception as exc:  # a data-source problem must not blank the page
+        return {"status": "error", "reason": str(exc), "rows": 0}
+
+
+def _render_ml_prediction_box(settings: AppSettings, storage: Storage) -> None:
+    """Home-page box: yesterday's close-based ML direction for every pair in SQL Server."""
+    result = _auto_sync_ml(settings, storage)
+    rows = storage.load_ml_latest_predictions()
+
+    prediction_date = rows[0]["prediction_date"] if rows else None
+    target_date = rows[0].get("target_date") if rows else None
+    title = "🤖 Daily ML Direction (SQL Server)"
+    if prediction_date:
+        title += f" — from {prediction_date} close, for {target_date}"
+
+    with st.expander(title, expanded=True):
+        if not settings.ml_source_configured:
+            st.info(
+                "SQL Server is not configured. Add SQL_SERVER / SQL_DATABASE and "
+                "credentials to `.env` to pull the daily ML predictions."
+            )
+            return
+
+        head, actions = st.columns([5, 1])
+        with actions:
+            if st.button("↻ Sync now", key="ml_sync_now", use_container_width=True):
+                with st.spinner("Reading SQL Server…"):
+                    result = sync_predictions(storage, settings, force=True)
+                rows = storage.load_ml_latest_predictions()
+                if result["status"] == "error":
+                    st.error(result["reason"])
+                else:
+                    st.success(f"Synced {result['rows']} rows")
+
+        if not rows:
+            with head:
+                if result["status"] == "error":
+                    st.error(f"Sync failed: {result['reason']}")
+                else:
+                    st.info("No ML predictions mirrored yet — click **Sync now**.")
+            return
+
+        df = pd.DataFrame(rows)
+        df["Direction"] = df["predicted_signal"].apply(_ml_signal_badge)
+        df["Lean"] = df.apply(
+            lambda r: _direction_label(implied_direction(r["prob_buy"], r["prob_sell"])), axis=1
+        )
+        df["Pair"] = df["pair"].apply(format_pair)
+
+        counts = df["predicted_signal"].value_counts().to_dict()
+        with head:
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Pairs", len(df))
+            c2.metric("🟢 BUY", counts.get("BUY", 0))
+            c3.metric("🔴 SELL", counts.get("SELL", 0))
+            c4.metric("⚪ HOLD", counts.get("HOLD", 0))
+
+        display = df[[
+            "Pair", "Direction", "signal_confidence", "Lean",
+            "prob_buy", "prob_sell", "base_close",
+        ]].rename(columns={
+            "signal_confidence": "Confidence",
+            "prob_buy": "P(up)",
+            "prob_sell": "P(down)",
+            "base_close": "Close",
+        })
+        st.dataframe(
+            display.style.format({
+                "Confidence": "{:.1%}", "P(up)": "{:.1%}", "P(down)": "{:.1%}",
+                "Close": "{:.5f}",
+            }, na_rep=""),
+            use_container_width=True, hide_index=True,
+            height=_grid_height(len(display)),
+        )
+
+        last_sync = storage.load_ml_last_sync(kind="predictions")
+        synced_at = last_sync.get("attempted_at") if last_sync else "never"
+        _, reason = sync_due(storage, settings)
+        st.caption(
+            f"Static daily snapshot — model `{df['model_name'].iloc[0]}` "
+            f"v`{df['model_version'].iloc[0]}`. Mirrored to SQLite; SQL Server was "
+            f"last contacted at {synced_at} UTC. Next check: {reason}. "
+            "**HOLD** means the model's confidence gate abstained, not a flat forecast — "
+            "the *Lean* column shows the direction underneath it."
+        )
+        if result["status"] == "error":
+            st.warning(f"Last sync attempt failed: {result['reason']}")
+
+
+def _render_reconcile_tab(settings: AppSettings, storage: Storage) -> None:
+    """
+    Score each New York session's realised move against that morning's ML call.
+
+    The prediction is made from the previous session's close and targets the next
+    one, so the natural checkpoint is 17:00 ET — the NY close, which is also where
+    OANDA's daily candle boundary sits.
+    """
+    st.subheader("ML Prediction Reconciliation")
+    st.caption(
+        "Each closed New York session (17:00 ET) scored against the ML direction "
+        "predicted from the previous session's close."
+    )
+
+    if not storage.load_ml_max_prediction_date():
+        st.info(
+            "No ML predictions mirrored yet. Open the **Results** tab and use "
+            "**Sync now** in the Daily ML Direction box."
+        )
+        return
+
+    latest_session = last_completed_session_date()
+    reconciled_dates = storage.load_ml_reconciled_dates()
+    known_dates = storage.load_ml_target_dates()
+    # Only sessions that have actually closed can be scored.
+    selectable = [d for d in known_dates if d <= latest_session.isoformat()]
+    if not selectable:
+        st.info(f"No predictions target a session on or before {latest_session}.")
+        return
+
+    ctrl1, ctrl2, ctrl3 = st.columns([2, 1, 3])
+    chosen = ctrl1.selectbox(
+        "Session (NY close)", selectable, index=0,
+        format_func=lambda d: f"{d}{'' if d in reconciled_dates else '  · not scored'}",
+    )
+    manual_eval = ctrl2.button("▶ Evaluate", use_container_width=True)
+    run_eval = manual_eval
+
+    api_ok = bool(settings.oanda_api_key)
+    if not api_ok:
+        ctrl3.warning("OANDA API key required to fetch the realised close.")
+
+    # Auto-evaluate the newest closed session, throttled so a session whose
+    # candles have not landed yet is retried on a timer, not every refresh.
+    if api_ok and not manual_eval and chosen == latest_session.isoformat():
+        due, _ = reconcile_due(storage, latest_session)
+        if due:
+            run_eval = True
+
+    if run_eval and api_ok:
+        with st.spinner(f"Scoring {chosen} against OANDA daily closes…"):
+            try:
+                # A manual click re-scores everything; the automatic pass only
+                # fills in pairs that are still outstanding.
+                outcome = reconcile_session(
+                    storage, OandaClient(settings),
+                    target_date=date.fromisoformat(chosen), force=manual_eval,
+                )
+            except Exception as exc:
+                outcome = {"status": "error", "reason": str(exc), "scored": 0}
+        if outcome["status"] == "error":
+            st.error(f"Reconcile failed: {outcome['reason']}")
+        elif outcome["scored"]:
+            st.success(f"Scored {outcome['scored']} pair(s) for {chosen}")
+        elif outcome["status"] == "pending":
+            st.info(f"Waiting on daily candles for {chosen}: {outcome['reason']}")
+
+    rows = storage.load_ml_reconciliation(target_date=chosen)
+    if not rows:
+        st.info(f"{chosen} has not been scored yet — click **Evaluate**.")
+    else:
+        df = pd.DataFrame(rows)
+
+        signal_calls = int((df["signal_outcome"].isin(["HIT", "MISS"])).sum())
+        signal_hits = int((df["signal_outcome"] == "HIT").sum())
+        lean_calls = int((df["implied_outcome"].isin(["HIT", "MISS"])).sum())
+        lean_hits = int((df["implied_outcome"] == "HIT").sum())
+
+        scoreable = int((df["signal_outcome"] != "NO_DATA").sum())
+        avg_move = df["actual_pips"].abs().mean()
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Actioned signals", f"{signal_calls}/{scoreable}",
+                  help="BUY or SELL calls. The rest were HOLD — the gate abstained.")
+        m2.metric("Signal accuracy", _hit_rate(signal_hits, signal_calls))
+        m3.metric("Lean accuracy", _hit_rate(lean_hits, lean_calls),
+                  help="Direction implied by P(up) vs P(down), scored on every pair "
+                       "including abstained ones.")
+        m4.metric("Avg |move|", f"{avg_move:.1f} pips" if avg_move == avg_move else "—")
+
+        no_data = df.loc[df["signal_outcome"] == "NO_DATA", "pair"].tolist()
+        if no_data:
+            st.caption(
+                f"⚠️ No broker price data for {', '.join(format_pair(p) for p in no_data)} — "
+                "predicted daily but not quoted by OANDA, so held out of the rates above."
+            )
+
+        display = pd.DataFrame({
+            "Pair": df["pair"].apply(format_pair),
+            "Predicted": df["predicted_signal"].apply(_ml_signal_badge),
+            "Conf": df["signal_confidence"],
+            "Lean": df["implied_direction"].apply(_direction_label),
+            "Actual": df["actual_direction"].apply(_direction_label),
+            "Move %": df["actual_return_pct"],
+            "Pips": df["actual_pips"],
+            "Signal": df["signal_outcome"].apply(_outcome_badge),
+            "Lean result": df["implied_outcome"].apply(_outcome_badge),
+            "Prev close": df["base_close"],
+            "Close": df["actual_close"],
+        })
+
+        def _shade(row):
+            if row["Signal"].endswith("HIT"):
+                return ["background-color: #d4edda; color: #000000"] * len(row)
+            if row["Signal"].endswith("MISS"):
+                return ["background-color: #f8d7da; color: #000000"] * len(row)
+            return [""] * len(row)
+
+        st.dataframe(
+            display.style
+            .format({"Conf": "{:.1%}", "Move %": "{:+.2f}%", "Pips": "{:+.1f}",
+                     "Prev close": "{:.5f}", "Close": "{:.5f}"}, na_rep="")
+            .apply(_shade, axis=1),
+            use_container_width=True, hide_index=True,
+            height=_grid_height(len(display)),
+        )
+
+        # Feed cross-check: the mirror's base close comes from SQL Server's own
+        # price history, the realised move from OANDA. A wide gap means the two
+        # feeds have diverged and the scoring below it is not comparable.
+        drift = (df["sql_base_close"] - df["base_close"]).abs()
+        worst = drift.max() if len(drift) else 0
+        if worst and worst > 0:
+            rel = (drift / df["base_close"]).max()
+            if rel > 0.002:
+                st.warning(
+                    f"SQL Server and OANDA disagree on the previous close by up to "
+                    f"{rel:.2%} — treat these results as indicative."
+                )
+
+    st.divider()
+    hist_head, hist_action = st.columns([4, 1])
+    hist_head.subheader("History")
+    if hist_action.button("⏮ Backfill", key="ml_backfill", disabled=not api_ok,
+                          use_container_width=True,
+                          help="Score every past session already mirrored. Costs one "
+                               "OANDA request per pair, not per session."):
+        with st.spinner("Scoring past sessions…"):
+            try:
+                filled = backfill_reconciliation(storage, OandaClient(settings))
+            except Exception as exc:
+                filled = {"status": "error", "reason": str(exc), "scored": 0}
+        if filled["status"] == "error":
+            st.error(f"Backfill failed: {filled['reason']}")
+        else:
+            st.success(f"Backfill: {filled['reason']}")
+
+    history = storage.load_ml_reconciliation_by_date()
+    if not history:
+        st.info("No sessions scored yet — use **Backfill** to score the mirrored history.")
+        return
+
+    hist_df = pd.DataFrame(history)
+    total_signal_calls = int(hist_df["signal_calls"].sum())
+    total_signal_hits = int(hist_df["signal_hits"].sum())
+    total_lean_calls = int(hist_df["lean_calls"].sum())
+    total_lean_hits = int(hist_df["lean_hits"].sum())
+
+    h1, h2, h3 = st.columns(3)
+    h1.metric("Sessions scored", len(hist_df))
+    h2.metric("Signal accuracy (all)", _hit_rate(total_signal_hits, total_signal_calls))
+    h3.metric("Lean accuracy (all)", _hit_rate(total_lean_hits, total_lean_calls))
+    if total_lean_calls:
+        st.caption(
+            "A directional coin flip is 50%. Lean accuracy is the honest read on the "
+            "daily model since it scores every pair; signal accuracy covers only the "
+            "days the gate took a side."
+        )
+
+    hist_display = pd.DataFrame({
+        "Session": hist_df["target_date"],
+        "Pairs": hist_df["pairs"],
+        "Signals": hist_df["signal_calls"],
+        "Signal hit rate": hist_df.apply(
+            lambda r: r["signal_hits"] / r["signal_calls"] if r["signal_calls"] else None, axis=1),
+        "Lean hit rate": hist_df.apply(
+            lambda r: r["lean_hits"] / r["lean_calls"] if r["lean_calls"] else None, axis=1),
+        "Avg move %": hist_df["avg_return_pct"],
+    })
+    st.dataframe(
+        hist_display.style.format(
+            {"Signal hit rate": "{:.0%}", "Lean hit rate": "{:.0%}", "Avg move %": "{:+.2f}%"},
+            na_rep="—",
+        ),
+        use_container_width=True, hide_index=True,
+    )
+
+    with st.expander("By pair"):
+        by_pair = storage.load_ml_reconciliation_by_pair()
+        if by_pair:
+            pair_df = pd.DataFrame(by_pair)
+            st.dataframe(
+                pd.DataFrame({
+                    "Pair": pair_df["pair"].apply(format_pair),
+                    "Sessions": pair_df["sessions"],
+                    "Signals": pair_df["signal_calls"],
+                    "Signal hit rate": pair_df.apply(
+                        lambda r: r["signal_hits"] / r["signal_calls"] if r["signal_calls"] else None, axis=1),
+                    "Lean hit rate": pair_df.apply(
+                        lambda r: r["lean_hits"] / r["lean_calls"] if r["lean_calls"] else None, axis=1),
+                }).style.format(
+                    {"Signal hit rate": "{:.0%}", "Lean hit rate": "{:.0%}"}, na_rep="—"
+                ),
+                use_container_width=True, hide_index=True,
+            )
 
 
 # ── Sidebar ──────────────────────────────────────────────────────────────────
@@ -201,6 +585,25 @@ def _render_sidebar() -> tuple:
     st.session_state.auto_refresh = auto_refresh
     st.session_state.refresh_seconds = refresh_secs
 
+    st.sidebar.divider()
+
+    # Display — how tall the main grids are allowed to grow before scrolling.
+    st.sidebar.subheader("Display")
+    table_rows = st.sidebar.slider(
+        "Table height (rows)",
+        min_value=MIN_TABLE_ROWS,
+        max_value=MAX_TABLE_ROWS,
+        value=int(st.session_state.table_rows),
+        step=1,
+        help="Rows shown before a grid starts scrolling. Grids never grow taller "
+             "than their own data, so raising this only removes scrollbars.",
+    )
+    st.session_state.table_rows = table_rows
+    st.sidebar.caption(
+        f"Scanner, ML direction, Reconcile and Live Quotes grids fit up to "
+        f"{table_rows} rows (~{_grid_height(table_rows)}px)."
+    )
+
     # Save prefs
     _save_prefs({
         "oanda_api_key": api_key,
@@ -210,6 +613,7 @@ def _render_sidebar() -> tuple:
         "refresh_seconds": refresh_secs,
         "universe_choice": st.session_state.universe_choice,
         "custom_pairs_raw": st.session_state.custom_pairs_raw,
+        "table_rows": table_rows,
     })
 
     return api_key, selected_pairs, max_spread, signal_mode, auto_refresh, refresh_secs
@@ -269,12 +673,17 @@ def _page_scanner(
             except Exception as exc:
                 st.error(f"Scan failed: {exc}")
 
-    tab_results, tab_watchlist, tab_perf, tab_model, tab_logs, tab_settings = st.tabs(
-        ["Results", "Watchlist", "Performance", "Model", "Scan Logs", "Settings"]
+    (tab_results, tab_reconcile, tab_watchlist, tab_perf,
+     tab_model, tab_logs, tab_settings) = st.tabs(
+        ["Results", "Reconcile", "Watchlist", "Performance", "Model", "Scan Logs", "Settings"]
     )
 
     # ── Results tab ──────────────────────────────────────────────────────────
     with tab_results:
+        # Daily ML direction from SQL Server — rendered before the scan results so
+        # it is visible on a cold start, when there is no scan to show yet.
+        _render_ml_prediction_box(settings, storage)
+
         rows = storage.load_latest_snapshots()
         if not rows:
             st.info("No scan results yet. Click 'Run Scan' to start.")
@@ -384,7 +793,10 @@ def _page_scanner(
             if "at_key_level" in display.columns or "blocked_ahead" in display.columns:
                 styled = styled.apply(_highlight_row, axis=1)
 
-            st.dataframe(styled, use_container_width=True, hide_index=True)
+            st.dataframe(
+                styled, use_container_width=True, hide_index=True,
+                height=_grid_height(len(display)),
+            )
 
             # Column guide
             with st.expander("Column Guide"):
@@ -842,6 +1254,10 @@ sample size.
             st.dataframe(ldf, use_container_width=True, hide_index=True)
 
     # ── Settings tab ──────────────────────────────────────────────────────────
+    # ── Reconcile tab ────────────────────────────────────────────────────────
+    with tab_reconcile:
+        _render_reconcile_tab(settings, storage)
+
     with tab_settings:
         last_run = storage.load_latest_scan_run()
         if last_run:
@@ -855,6 +1271,37 @@ sample size.
             "signal_mode": signal_mode,
             "oanda_env": settings.oanda_env,
         })
+
+        st.subheader("Daily ML Source (SQL Server)")
+        st.json({
+            "configured": settings.ml_source_configured,
+            "server": settings.sql_server or "—",
+            "database": settings.sql_database or "—",
+            "table": settings.ml_predictions_table,
+            "auth": "windows" if settings.sql_trusted_connection else "sql login",
+            "min_sync_interval_minutes": settings.ml_sync_min_interval_minutes,
+            "mirrored_through": storage.load_ml_max_prediction_date() or "—",
+            "expected_latest_run": expected_prediction_date().isoformat(),
+        })
+        if st.button("Test SQL Server connection", key="ml_test_conn"):
+            from forex.sqlserver import MLSourceError, test_connection
+            try:
+                probe = test_connection(settings)
+                st.success("Connected to SQL Server")
+                st.json(probe)
+            except MLSourceError as exc:
+                st.error(str(exc))
+
+        sync_log = storage.load_ml_sync_log(limit=15)
+        if sync_log:
+            st.caption("Recent ML sync / reconcile attempts")
+            st.dataframe(
+                pd.DataFrame(sync_log)[
+                    ["attempted_at", "kind", "status", "rows_synced",
+                     "max_prediction_date", "message"]
+                ],
+                use_container_width=True, hide_index=True,
+            )
 
 
 # ── Live Quotes page ─────────────────────────────────────────────────────────
@@ -919,6 +1366,7 @@ def _page_live_quotes(settings: AppSettings, storage: Storage, selected_pairs: l
             display.style.apply(_row_color, axis=1).format(price_fmt),
             use_container_width=True,
             hide_index=True,
+            height=_grid_height(len(display)),
         )
 
         st.caption(

@@ -32,3 +32,24 @@ def spread_to_pips(pair: str, spread: float) -> float:
 def format_pair(pair: str) -> str:
     """Convert EUR_USD to EUR/USD for display."""
     return pair.replace("_", "/")
+
+
+def pip_value(pair: str) -> float:
+    """Price move worth one pip for this pair."""
+    return 0.01 if "JPY" in pair.upper() else 0.0001
+
+
+def to_oanda_pair(symbol: str) -> str:
+    """
+    Normalise an external pair symbol to OANDA's ``EUR_USD`` form.
+
+    The daily ML repo stores pairs unseparated (``EURUSD``); other sources use
+    ``EUR/USD`` or ``EUR-USD``. Anything that is not a recognisable 6-character
+    pair is upper-cased and returned as-is rather than mangled, so an unexpected
+    symbol shows up in the UI instead of silently matching the wrong instrument.
+    """
+    raw = (symbol or "").strip().upper()
+    compact = raw.replace("/", "").replace("_", "").replace("-", "").replace(" ", "")
+    if len(compact) == 6 and compact.isalpha():
+        return f"{compact[:3]}_{compact[3:]}"
+    return raw
