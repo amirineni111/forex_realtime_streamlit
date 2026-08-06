@@ -326,6 +326,16 @@ _MAX_COST_RATIO = 0.15    # hard veto above this; nothing actionable survives it
 # the broker while adding variance, so demand a real cushion.
 _PROB_MARGIN = 0.04
 
+# Plain shorts are switched off. Replaying all 1096 resolved trades against real M5
+# bars (scripts/rr_experiment.py) shows SHORT_CANDIDATE losing at every reward:risk
+# tested — -0.084R at RR 1.0 through -0.192R at RR 3.0, n=458, and -708 of the -776
+# total net pips. No target choice rescues it, so the entry itself is wrong rather
+# than badly bracketed. Longs over the same window are flat (+0.013R at RR 1.5),
+# and STRONG_SHORT is left alone: it carries the MTF gate and is only n=87, too
+# thin to condemn. Setups still surface as WATCH_ONLY so the pattern stays visible
+# in the dashboard for when there is enough data to re-test this.
+_SUPPRESS_SHORT_CANDIDATE = True
+
 
 def breakeven_win_rate(rr: float = _RR, cost_ratio: float = 0.0) -> float:
     """
@@ -535,8 +545,15 @@ def score_pair(
         trade_signal = "BUY_CANDIDATE"
         reason = f"Long candidate ({total:.0f}pts)"
     elif total >= 45 and dominant == "SHORT":
-        trade_signal = "SHORT_CANDIDATE"
-        reason = f"Short candidate ({total:.0f}pts)"
+        if _SUPPRESS_SHORT_CANDIDATE:
+            trade_signal = "WATCH_ONLY"
+            reason = (
+                f"Short setup ({total:.0f}pts) — plain shorts suppressed, measured "
+                f"-0.11R over 458 trades"
+            )
+        else:
+            trade_signal = "SHORT_CANDIDATE"
+            reason = f"Short candidate ({total:.0f}pts)"
     elif total >= 25:
         trade_signal = "WATCH_ONLY"
         reason = f"Mixed signals ({total:.0f}pts)"

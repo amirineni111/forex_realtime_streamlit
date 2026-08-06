@@ -1191,6 +1191,24 @@ sample size.
                     use_container_width=True, hide_index=True,
                 )
 
+            st.markdown("#### Run in shadow (recommended first step)")
+            st.caption(
+                "Shadow scores every setup and logs the probability, but never vetoes. "
+                "It is the only way to find out what the model would do to the trades it "
+                "wants to block — once it is gating, those trades stop happening and stop "
+                "being measurable. Check progress with `python scripts/model_report.py`."
+            )
+            if st.button(f"Run model #{rep['id']} in shadow"):
+                if storage.shadow_model(rep["id"]):
+                    st.success(
+                        f"Model #{rep['id']} is now shadowing. Nothing is gated; "
+                        f"probabilities are logged against every tracked trade."
+                    )
+                    st.session_state.model_report = None
+                    st.rerun()
+                else:
+                    st.error("Could not set shadow — model id not found.")
+
             st.markdown("#### Promote")
             if rep["passes"]:
                 st.caption("This model clears the gate. Promoting makes it veto live signals "
@@ -1221,22 +1239,32 @@ sample size.
             st.markdown("### Model history")
             st.dataframe(pd.DataFrame(models), use_container_width=True, hide_index=True)
 
-            h1, h2 = st.columns([3, 1])
+            def _label(i: int) -> str:
+                m = next((x for x in models if x["id"] == i), {})
+                tag = " (active)" if m.get("is_active") else (
+                    " (shadow)" if m.get("is_shadow") else "")
+                return f"#{i}{tag}"
+
+            h1, h2, h3 = st.columns([3, 1, 1])
             options = [m["id"] for m in models]
-            pick = h1.selectbox(
-                "Roll back to a previous model", options,
-                format_func=lambda i: (
-                    f"#{i}" + (" (active)" if any(m["id"] == i and m["is_active"] for m in models) else "")
-                ),
-            )
+            pick = h1.selectbox("Select a model", options, format_func=_label)
             if h2.button("Activate", key="rollback_activate"):
                 if storage.activate_model(int(pick)):
-                    st.success(f"Model #{pick} is now active.")
+                    st.success(f"Model #{pick} is now active and gating.")
+                    st.rerun()
+            if h3.button("Shadow", key="rollback_shadow"):
+                if storage.shadow_model(int(pick)):
+                    st.success(f"Model #{pick} is now shadowing (logging only).")
                     st.rerun()
 
             if active and st.button("Disable model (revert to rules-only)"):
                 storage.deactivate_all_models()
                 st.info("All models deactivated — the scanner is rules-only again.")
+                st.rerun()
+
+            if any(m.get("is_shadow") for m in models) and st.button("Stop shadowing"):
+                storage.clear_shadow_model()
+                st.info("Shadow cleared — no model is scoring.")
                 st.rerun()
 
         st.caption(

@@ -182,6 +182,46 @@ class TestCandidateAndPromotion:
         # The model itself survives, so it can be rolled forward again.
         assert any(m["id"] == mid for m in store.load_models())
 
+    def test_shadow_model_is_served_but_not_active(self, store):
+        _seed(store, 400)
+        mid = save_candidate(store, evaluate_and_fit(store))
+        assert store.shadow_model(mid) is True
+        # Shadow is the offline lane: the scanner can score with it, but nothing
+        # gates on it, so load_active_model_json must stay empty.
+        assert store.load_active_model_json() is None
+        assert store.load_shadow_model_json() is not None
+
+    def test_a_model_cannot_gate_and_shadow_at_once(self, store):
+        _seed(store, 400)
+        mid = save_candidate(store, evaluate_and_fit(store))
+        store.shadow_model(mid)
+        store.activate_model(mid)
+        row = [m for m in store.load_models() if m["id"] == mid][0]
+        assert (row["is_active"], row["is_shadow"]) == (1, 0)
+        # And back the other way, so promotion is reversible into shadow.
+        store.shadow_model(mid)
+        row = [m for m in store.load_models() if m["id"] == mid][0]
+        assert (row["is_active"], row["is_shadow"]) == (0, 1)
+
+    def test_only_one_model_shadows_at_a_time(self, store):
+        _seed(store, 400)
+        first = save_candidate(store, evaluate_and_fit(store))
+        second = save_candidate(store, evaluate_and_fit(store, l2=5.0))
+        store.shadow_model(first)
+        store.shadow_model(second)
+        assert [m["id"] for m in store.load_models() if m["is_shadow"]] == [second]
+
+    def test_shadowing_a_missing_id_is_rejected(self, store):
+        assert store.shadow_model(99999) is False
+
+    def test_clear_shadow_leaves_the_model_stored(self, store):
+        _seed(store, 400)
+        mid = save_candidate(store, evaluate_and_fit(store))
+        store.shadow_model(mid)
+        store.clear_shadow_model()
+        assert store.load_shadow_model_json() is None
+        assert any(m["id"] == mid for m in store.load_models())
+
     def test_promoted_model_is_servable(self, store):
         _seed(store, 400)
         report = evaluate_and_fit(store)

@@ -34,10 +34,18 @@ def _apply_scoring(s: ForexSnapshot, scoring: dict) -> None:
             setattr(s, field, scoring[field])
 
 
-def _load_model(storage: Storage):
-    """Active direction model, or None when the loop has not been trained yet."""
+def _load_model(storage: Storage, shadow: bool = False):
+    """
+    The active (gating) model, or with ``shadow=True`` the shadow (logging-only) one.
+
+    Returns None when the loop has not been trained yet, or when the stored model
+    was trained against a different feature contract.
+    """
     try:
-        payload = storage.load_active_model_json()
+        payload = (
+            storage.load_shadow_model_json() if shadow
+            else storage.load_active_model_json()
+        )
         if not payload:
             return None
         from .model import ForexModel
@@ -238,6 +246,9 @@ def run_scan(
     # strength, so both run here rather than inside the parallel fetch. All DB writes
     # are single-threaded in this block.
     model = _load_model(storage)
+    # Only consulted when nothing is gating, so a shadow run is never mistaken for a
+    # live one and the two can never both touch the same probability.
+    shadow_model = _load_model(storage, shadow=True) if model is None else None
 
     strength_scores = calculate_strength([s.model_dump() for s in snapshots]) if snapshots else {}
     for s in snapshots:
@@ -294,14 +305,21 @@ def run_scan(
             feats = build_features(feat_snap, direction)
             features_by_pair[s.pair] = feats
 
-            if model is not None:
+            scorer = model or shadow_model
+            if scorer is not None:
                 try:
-                    model_prob = round(model.predict_proba(feats), 4)
+                    model_prob = round(scorer.predict_proba(feats), 4)
                 except Exception as exc:
                     storage.log_pair(scan_id, s.pair, None, f"Model scoring failed: {exc}")
                     model_prob = None
                 if model_prob is not None:
-                    scoring = _rescore(model_prob, bonus)
+                    if model is not None:
+                        scoring = _rescore(model_prob, bonus)
+                    else:
+                        # Shadow: record the probability and the bar it would have had
+                        # to clear, but leave trade_signal exactly as the rules set it.
+                        # Rescoring here would re-introduce the veto by the back door.
+                        scoring = {**scoring, "model_prob": model_prob}
 
         _apply_scoring(s, scoring)
 
@@ -364,6 +382,10 @@ def run_scan(
                     adx14=s.adx14,
                     regime=s.regime,
                     session=s.current_session,
+                    model_mode=(
+                        "active" if model is not None
+                        else ("shadow" if shadow_model is not None else None)
+                    ),
                 )
             except Exception as exc:
                 storage.log_pair(scan_id, s.pair, None, f"Tracking record failed: {exc}")

@@ -13,6 +13,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from forex import signals
 from forex.features import FEATURE_NAMES, FEATURE_VERSION, build_features, to_vector
 from forex.model import (
     ForexModel, build_matrix, fit, gated_performance, roc_auc, top_decile_precision,
@@ -182,6 +183,52 @@ class TestScorePairGating:
             h1_direction="LONG", h4_direction="LONG", model_prob=0.80,
         )
         assert out["trade_signal"] in ("STRONG_BUY", "BUY_CANDIDATE")
+
+    # A plain short needs a score over 45 without the MTF confluence that would
+    # promote it to STRONG_SHORT, which the suppression deliberately spares.
+    _PLAIN_SHORT = dict(
+        pair="EUR_USD", bid=1.0969, ask=1.0971, spread_pips=1.0,
+        session="London_NY_Overlap", h1_direction="NEUTRAL", h4_direction="NEUTRAL",
+    )
+
+    @staticmethod
+    def _bearish():
+        return _indicators(
+            close=1.0970, rsi14=38.0, ema9=1.0965, ema20=1.0985,
+            macd=-0.0004, macd_histogram=-0.0002, day_change_pct=-0.15,
+        )
+
+    def test_plain_short_setup_is_suppressed_to_watch_only(self, monkeypatch):
+        out = score_pair(indicators=self._bearish(), **self._PLAIN_SHORT)
+        assert out["total_score"] >= 45          # would otherwise be actionable
+        assert out["trade_signal"] == "WATCH_ONLY"
+        assert "suppressed" in out["signal_reason"]
+
+        # Same setup with the switch off is a SHORT_CANDIDATE, so the downgrade is
+        # attributable to the suppression rather than to the fixture being weak.
+        monkeypatch.setattr(signals, "_SUPPRESS_SHORT_CANDIDATE", False)
+        assert score_pair(
+            indicators=self._bearish(), **self._PLAIN_SHORT
+        )["trade_signal"] == "SHORT_CANDIDATE"
+
+    def test_strong_short_survives_the_suppression(self):
+        # STRONG_SHORT carries the MTF gate and was not measured as losing, so the
+        # switch must not take it down with the plain shorts.
+        out = score_pair(
+            pair="EUR_USD", bid=1.0969, ask=1.0971, spread_pips=1.0,
+            indicators=self._bearish(), session="London_NY_Overlap",
+            h1_direction="SHORT", h4_direction="SHORT",
+        )
+        assert out["trade_signal"] == "STRONG_SHORT"
+        assert out["suggested_stop"] is not None
+
+    def test_suppressed_short_carries_no_trade_levels(self):
+        out = score_pair(indicators=self._bearish(), **self._PLAIN_SHORT)
+        # WATCH_ONLY rows are not tracked, so emitting a stop/target would put an
+        # untracked bracket in front of the user.
+        assert out["trade_signal"] == "WATCH_ONLY"
+        assert out["suggested_stop"] is None
+        assert out["suggested_target"] is None
 
     def test_strength_bonus_is_inside_total_score(self):
         without = score_pair(
@@ -380,6 +427,13 @@ class TestTrackingAndEvaluation:
         assert set(feats) == set(FEATURE_NAMES)
         assert row["feature_version"] == FEATURE_VERSION
         assert row["model_prob"] == 0.55
+
+    def test_model_mode_is_persisted_at_arm_time(self, store):
+        self._arm(store, model_mode="shadow")
+        row = store.load_tracked_signals("open")[0]
+        # Without this, shadow rows and gated rows pool together in the report and
+        # the censored sample silently flatters the model.
+        assert row["model_mode"] == "shadow"
 
     def test_target_hit_records_a_linked_net_of_cost_win(self, store):
         tid = self._arm(store)

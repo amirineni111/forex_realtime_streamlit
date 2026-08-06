@@ -82,6 +82,47 @@ class OandaClient:
             f"/v3/instruments/{pair}/candles",
             params={"granularity": granularity, "count": count, "price": "M"},
         )
+        return self._parse_candles(data, pair, granularity)
+
+    def get_candles_range(
+        self,
+        pair: str,
+        start: str,
+        end: str,
+        granularity: str = "M5",
+    ) -> List[ForexBar]:
+        """
+        Fetch every completed candle in ``[start, end]`` (RFC3339 strings).
+
+        ``get_candles`` can only reach backwards from now by ``count``, which is fine
+        for live scanning but useless for replaying a trade that closed weeks ago.
+        OANDA caps a single response at 5000 candles, so this pages forward on the
+        last returned timestamp until the window is covered. The API rejects
+        ``from``+``to``+``count`` together, so paging uses ``from``+``count`` and the
+        tail is trimmed against ``end`` here.
+        """
+        bars: List[ForexBar] = []
+        cursor = start
+        seen: set = set()
+        while cursor < end:
+            data = self._get(
+                f"/v3/instruments/{pair}/candles",
+                params={
+                    "granularity": granularity, "price": "M",
+                    "from": cursor, "count": 5000,
+                },
+            )
+            page = self._parse_candles(data, pair, granularity)
+            fresh = [b for b in page if b.timestamp not in seen]
+            if not fresh:
+                break  # no forward progress (weekend gap or end of history)
+            seen.update(b.timestamp for b in fresh)
+            bars.extend(b for b in fresh if b.timestamp <= end)
+            cursor = fresh[-1].timestamp
+        return bars
+
+    @staticmethod
+    def _parse_candles(data: dict, pair: str, granularity: str) -> List[ForexBar]:
         bars: List[ForexBar] = []
         for candle in data.get("candles", []):
             # Skip the still-forming bar — including it makes every indicator
