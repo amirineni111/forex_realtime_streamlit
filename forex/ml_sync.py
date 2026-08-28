@@ -265,6 +265,49 @@ def score_prediction(prediction: dict, base_close: float, actual_close: float) -
     }
 
 
+def _as_float(value) -> Optional[float]:
+    """Coerce to float, treating None, NaN and non-numerics alike as missing."""
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    return None if out != out else out
+
+
+def live_progress(prediction: dict, current_price) -> dict:
+    """
+    Where an open session currently sits against the ML call.
+
+    This is the same base-to-close comparison ``score_prediction`` will make at
+    the 17:00 ET close, with the live price standing in for the close that has
+    not been published yet — so the verdict is a running preview of the row the
+    reconcile will write, not a second, differently-defined metric. It stays a
+    preview: until the session closes the direction can still flip.
+
+    ``base_close`` is the source close the model itself predicted from, which is
+    also what makes the two comparable; broker and source closes agree to the
+    last digit (see module docstring).
+    """
+    base = _as_float(prediction.get("base_close"))
+    price = _as_float(current_price)
+    if base is None or price is None or base == 0:
+        return {
+            "current_price": price, "current_direction": None,
+            "move_pips": None, "move_pct": None,
+            "signal_status": None, "lean_status": None,
+        }
+
+    scored = score_prediction(prediction, base, price)
+    return {
+        "current_price": price,
+        "current_direction": scored["actual_direction"],
+        "move_pips": scored["actual_pips"],
+        "move_pct": scored["actual_return_pct"],
+        "signal_status": scored["signal_outcome"],
+        "lean_status": scored["implied_outcome"],
+    }
+
+
 def unscoreable_row(prediction: dict, reason: str) -> dict:
     """
     A placeholder for a prediction that can never be scored against this broker.

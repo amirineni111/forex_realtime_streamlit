@@ -12,7 +12,7 @@ from forex.features import FEATURE_VERSION
 from forex.market_sessions import current_session, is_forex_market_open, session_badge_color
 from forex.ml_sync import (
     backfill_reconciliation, expected_prediction_date, implied_direction,
-    last_completed_session_date, reconcile_due, reconcile_session,
+    last_completed_session_date, live_progress, reconcile_due, reconcile_session,
     sync_due, sync_predictions,
 )
 from forex.model import MIN_TRAIN_SAMPLES
@@ -165,6 +165,85 @@ def _hit_rate(hits, calls) -> str:
     return f"{hits / calls:.0%} ({int(hits)}/{int(calls)})"
 
 
+_TRACK_BADGES = {
+    "HIT": "✅ ON TRACK",
+    "MISS": "❌ OFF TRACK",
+    "ABSTAIN": "➖ NO CALL",
+    "N/A": "—",
+}
+
+
+def _track_badge(status) -> str:
+    """Live wording for a running verdict — deliberately not the settled HIT/MISS."""
+    return _TRACK_BADGES.get(status, "—")
+
+
+# Streamlit re-runs the whole script on every widget interaction, not only on the
+# refresh timer, so the live quote is cached for a fraction of the shortest
+# refresh interval (30s): clicks reuse the last price, the timer always gets a
+# fresh one.
+LIVE_PRICE_TTL_SECONDS = 15
+
+
+@st.cache_data(ttl=LIVE_PRICE_TTL_SECONDS, show_spinner=False)
+def _fetch_live_mids(pairs: tuple, api_key: str, account_id: str, env: str) -> dict:
+    """
+    Current mid per pair, plus any pair this account cannot quote.
+
+    One pricing request covers the whole list, but OANDA rejects the *entire*
+    batch when a single instrument is unknown to the account — and the daily
+    model predicts instruments OANDA no longer quotes (the same ones reconcile
+    records as NO_DATA). A failed batch therefore falls back to one request per
+    pair, which salvages the rest and names the offenders so the caller can stop
+    asking for them.
+    """
+    settings = get_settings().model_copy(update={
+        "oanda_api_key": api_key,
+        "oanda_account_id": account_id or None,
+        "oanda_env": env,
+    })
+    client = OandaClient(settings)
+
+    def _mids(batch) -> dict:
+        return {
+            q.pair: {"mid": (q.bid + q.ask) / 2, "as_of": q.as_of}
+            for q in client.get_pricing(list(batch))
+        }
+
+    try:
+        return {"prices": _mids(pairs), "unavailable": [], "error": None}
+    except Exception as batch_exc:
+        prices, unavailable = {}, []
+        for pair in pairs:
+            try:
+                prices.update(_mids([pair]))
+            except Exception:
+                unavailable.append(pair)
+        if not prices:
+            # Nothing came back at all — this is a connection/auth problem, not a
+            # bad instrument, so report it instead of blaming every pair.
+            return {"prices": {}, "unavailable": [], "error": str(batch_exc)}
+        return {"prices": prices, "unavailable": unavailable, "error": None}
+
+
+def _live_ml_prices(df: pd.DataFrame, settings: AppSettings) -> tuple:
+    """Live mids for the predicted pairs; returns ``(prices, error)``."""
+    if not settings.oanda_api_key or df.empty:
+        return {}, None
+
+    skip = set(st.session_state.get("ml_live_price_skip", ()))
+    wanted = tuple(sorted(p for p in df["pair"].unique() if p not in skip))
+    if not wanted:
+        return {}, None
+
+    fetched = _fetch_live_mids(
+        wanted, settings.oanda_api_key, settings.oanda_account_id or "", settings.oanda_env,
+    )
+    if fetched["unavailable"]:
+        st.session_state.ml_live_price_skip = sorted(skip.union(fetched["unavailable"]))
+    return fetched["prices"], fetched["error"]
+
+
 def _auto_sync_ml(settings: AppSettings, storage: Storage) -> dict:
     """
     Refresh the SQLite mirror if — and only if — it is behind the day's run.
@@ -224,29 +303,66 @@ def _render_ml_prediction_box(settings: AppSettings, storage: Storage) -> None:
         )
         df["Pair"] = df["pair"].apply(format_pair)
 
+        # Live leg: where price sits *now* against the close the model predicted
+        # from. Refreshed with the page, so the static morning call and the
+        # running market read sit on the same row.
+        live_prices, live_error = _live_ml_prices(df, settings)
+        progress = [
+            live_progress(row, (live_prices.get(row["pair"]) or {}).get("mid"))
+            for row in df.to_dict("records")
+        ]
+        df["Now"] = [p["current_price"] for p in progress]
+        df["Now Dir"] = [_direction_label(p["current_direction"]) for p in progress]
+        df["Move (pips)"] = [p["move_pips"] for p in progress]
+        df["Move %"] = [p["move_pct"] for p in progress]
+        df["vs Signal"] = [_track_badge(p["signal_status"]) for p in progress]
+        df["vs Lean"] = [_track_badge(p["lean_status"]) for p in progress]
+
         counts = df["predicted_signal"].value_counts().to_dict()
+        called = [p for p in progress if p["signal_status"] in ("HIT", "MISS")]
+        on_track = sum(1 for p in called if p["signal_status"] == "HIT")
         with head:
-            c1, c2, c3, c4 = st.columns(4)
+            c1, c2, c3, c4, c5 = st.columns(5)
             c1.metric("Pairs", len(df))
             c2.metric("🟢 BUY", counts.get("BUY", 0))
             c3.metric("🔴 SELL", counts.get("SELL", 0))
             c4.metric("⚪ HOLD", counts.get("HOLD", 0))
+            c5.metric(
+                "✅ On track",
+                f"{on_track}/{len(called)}" if called else "—",
+                help="BUY/SELL calls whose direction the live price currently agrees with.",
+            )
 
+        live_cols = ["Now", "Move (pips)", "Move %", "Now Dir", "vs Signal", "vs Lean"]
         display = df[[
-            "Pair", "Direction", "signal_confidence", "Lean",
-            "prob_buy", "prob_sell", "base_close",
+            "Pair", "Direction", "signal_confidence", "Lean", "base_close",
+            *(live_cols if live_prices else []),
+            "prob_buy", "prob_sell",
         ]].rename(columns={
             "signal_confidence": "Confidence",
             "prob_buy": "P(up)",
             "prob_sell": "P(down)",
             "base_close": "Close",
         })
+
+        def _track_row(row):
+            verdict = row.get("vs Signal", "")
+            if verdict.endswith("ON TRACK"):
+                return ["background-color: #d8f3d8; color: #000000"] * len(row)
+            if verdict.endswith("OFF TRACK"):
+                return ["background-color: #f8d7da; color: #000000"] * len(row)
+            return [""] * len(row)
+
+        styled = display.style.format({
+            "Confidence": "{:.1%}", "P(up)": "{:.1%}", "P(down)": "{:.1%}",
+            "Close": "{:.5f}", "Now": "{:.5f}",
+            "Move (pips)": "{:+.1f}", "Move %": "{:+.2f}%",
+        }, na_rep="")
+        if live_prices:
+            styled = styled.apply(_track_row, axis=1)
+
         st.dataframe(
-            display.style.format({
-                "Confidence": "{:.1%}", "P(up)": "{:.1%}", "P(down)": "{:.1%}",
-                "Close": "{:.5f}",
-            }, na_rep=""),
-            use_container_width=True, hide_index=True,
+            styled, use_container_width=True, hide_index=True,
             height=_grid_height(len(display)),
         )
 
@@ -260,6 +376,31 @@ def _render_ml_prediction_box(settings: AppSettings, storage: Storage) -> None:
             "**HOLD** means the model's confidence gate abstained, not a flat forecast — "
             "the *Lean* column shows the direction underneath it."
         )
+
+        if live_prices:
+            quoted_at = next(
+                (q.get("as_of") for q in live_prices.values() if q.get("as_of")), "—"
+            )
+            st.caption(
+                f"**Now** is the live OANDA mid ({len(live_prices)} pairs, quoted "
+                f"{quoted_at}), and the move is measured from the same "
+                f"{prediction_date} close the model predicted from — so *vs Signal* / "
+                f"*vs Lean* preview the verdict the {target_date} reconcile will record "
+                "at the 17:00 ET close. Until that close it can still flip."
+                + ("" if is_forex_market_open() else " Market is closed — prices are last-traded.")
+            )
+        elif not settings.oanda_api_key:
+            st.caption("Add an OANDA API key in the sidebar to compare the live price against each call.")
+        elif live_error:
+            st.caption(f"Live prices unavailable: {live_error}")
+
+        skipped = st.session_state.get("ml_live_price_skip", [])
+        if skipped:
+            st.caption(
+                "No live quote from this OANDA account for: "
+                + ", ".join(format_pair(p) for p in skipped)
+            )
+
         if result["status"] == "error":
             st.warning(f"Last sync attempt failed: {result['reason']}")
 

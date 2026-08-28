@@ -16,8 +16,8 @@ import pytest
 from forex.config import AppSettings
 from forex.ml_sync import (
     backfill_reconciliation, candle_trading_date, expected_prediction_date,
-    implied_direction, last_completed_session_date, reconcile_due, reconcile_session,
-    score_prediction, sync_due, sync_predictions,
+    implied_direction, last_completed_session_date, live_progress, reconcile_due,
+    reconcile_session, score_prediction, sync_due, sync_predictions,
 )
 from forex.pairs import to_oanda_pair
 from forex.storage import Storage
@@ -174,6 +174,51 @@ class TestScorePrediction:
         row = score_prediction(_prediction(), 1.14668, 1.14668)
         assert row["actual_direction"] == "FLAT"
         assert row["implied_outcome"] == "N/A"
+
+
+class TestLiveProgress:
+    """
+    The dashboard's running read of an open session. It must agree with what
+    ``score_prediction`` will write at the close, or the box would preview a
+    verdict the Reconcile tab then contradicts.
+    """
+
+    def test_price_above_the_base_close_tracks_a_buy(self):
+        row = live_progress(_prediction(signal="BUY"), 1.15280)
+        assert row["current_direction"] == "UP"
+        assert row["signal_status"] == "HIT"
+        assert row["lean_status"] == "HIT"
+        assert row["move_pips"] == pytest.approx(61.2, abs=0.2)
+        assert row["move_pct"] == pytest.approx(0.5337, abs=1e-3)
+
+    def test_price_below_the_base_close_runs_against_a_buy(self):
+        assert live_progress(_prediction(signal="BUY"), 1.14000)["signal_status"] == "MISS"
+
+    def test_hold_abstains_live_too_but_keeps_a_lean(self):
+        row = live_progress(
+            _prediction(signal="HOLD", prob_buy=0.52, prob_sell=0.48), 1.15280
+        )
+        assert row["signal_status"] == "ABSTAIN"
+        assert row["lean_status"] == "HIT"
+
+    def test_matches_the_reconcile_verdict_for_the_same_price(self):
+        prediction = _prediction(signal="SELL", prob_buy=0.38, prob_sell=0.62)
+        settled = score_prediction(prediction, prediction["base_close"], 1.14000)
+        running = live_progress(prediction, 1.14000)
+        assert running["signal_status"] == settled["signal_outcome"]
+        assert running["current_direction"] == settled["actual_direction"]
+        assert running["move_pips"] == settled["actual_pips"]
+
+    @pytest.mark.parametrize("price", [None, float("nan"), "n/a"])
+    def test_missing_price_yields_no_verdict(self, price):
+        row = live_progress(_prediction(), price)
+        assert row["current_direction"] is None
+        assert row["signal_status"] is None
+
+    def test_missing_base_close_yields_no_verdict(self):
+        """A pair with no source close cannot be compared to anything."""
+        row = live_progress(_prediction(base_close=None), 1.15280)
+        assert row["signal_status"] is None
 
 
 # ── Sync budget ─────────────────────────────────────────────────────────────
