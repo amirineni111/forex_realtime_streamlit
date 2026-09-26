@@ -145,15 +145,84 @@ def _indicators(**over):
 
 class TestScorePairGating:
     def test_wide_spread_relative_to_stop_is_vetoed(self):
+        """
+        The cost veto has to be able to actually fire.
+
+        It used to be unreachable: the stop was defined as ``max(..., 8 x spread)``,
+        which bounds cost_ratio at 1/8 = 0.125 by construction, so the ``> 0.15``
+        veto was dead code and every wide-spread setup was silently handed a stop
+        wide enough to make its cost look acceptable. Measured effect: the spread
+        floor bound on 772 of 846 trades, pinning cost at exactly 12.5% of risk
+        against a gross edge of -0.05R.
+
+        Widening is now capped at _MAX_STOP_WIDEN_RATIO x the timeframe's bracket
+        scale, so a spread the pair's *current volatility* cannot amortise leaves
+        cost_ratio above the limit and the setup is rejected rather than re-bracketed.
+        A 10-pip spread against a 2-pip ATR is exactly that case.
+        """
         out = score_pair(
             pair="USD_HKD", bid=1.0995, ask=1.1005, spread_pips=10.0,
-            indicators=_indicators(), session="London", max_spread_pips=12.0,
+            indicators=_indicators(atr14=0.0002), session="London",
+            max_spread_pips=12.0, h1_direction="LONG", h4_direction="LONG",
+        )
+        assert out["cost_ratio"] is not None
+        assert out["cost_ratio"] > _MAX_COST_RATIO
+        assert out["trade_signal"] == "AVOID"
+        assert "cost" in out["signal_reason"].lower()
+
+    def test_stop_widens_toward_the_cost_limit_when_volatility_alone_is_too_tight(self):
+        """
+        A spread that the volatility stop would not amortise widens the stop to the
+        point where cost lands exactly on the limit — provided that point is inside
+        the ceiling.
+        """
+        out = score_pair(
+            pair="EUR_USD", bid=1.0999, ask=1.1001, spread_pips=2.0,
+            indicators=_indicators(atr14=0.0002), session="London_NY_Overlap",
             h1_direction="LONG", h4_direction="LONG",
         )
-        # Stop scales with spread, so cost_ratio lands at the 1/8 floor rather than
-        # blowing past the veto — the point is that the stop widened to absorb it.
-        assert out["cost_ratio"] is not None
-        assert out["cost_ratio"] <= _MAX_COST_RATIO
+        # 2 pip spread at a 10% cost limit wants a 20-pip stop; the M15 bracket
+        # scale on a 2-pip ATR is only 10 pips, so cost is what set the size.
+        assert out["prov_stop_pips"] == pytest.approx(20.0, rel=1e-3)
+        assert out["cost_ratio"] == pytest.approx(_MAX_COST_RATIO, rel=1e-3)
+
+    def test_stop_never_widens_past_the_volatility_ceiling(self):
+        """
+        Widening is bounded: a stop far outside the pair's current volatility is no
+        longer the same trade, so cost is amortised only up to the ceiling and the
+        setup is vetoed beyond it.
+        """
+        atr = 0.0002
+        out = score_pair(
+            pair="EUR_USD", bid=1.0995, ask=1.1005, spread_pips=5.0,
+            indicators=_indicators(atr14=atr), session="London_NY_Overlap",
+            max_spread_pips=8.0, h1_direction="LONG", h4_direction="LONG",
+        )
+        pip = 0.0001
+        ceiling_pips = (signals._MAX_STOP_WIDEN_RATIO
+                        * signals.stop_atr_mult() * atr / pip)
+        assert out["prov_stop_pips"] <= ceiling_pips + 1e-6
+        assert out["cost_ratio"] > _MAX_COST_RATIO
+        assert out["trade_signal"] == "AVOID"
+
+    def test_bracket_scale_is_per_timeframe(self):
+        """
+        ATR is a property of the bar size, so one multiple cannot serve every
+        timeframe. M5 ATR on a major is 2-4 pips; M15 is ~3x that. Backtesting over
+        9 months put the M15 optimum at 5xATR, where a ~1.6 pip spread is ~6% of
+        risk instead of the 12.5% the old M5 bracket was pinned at.
+        """
+        assert signals.stop_atr_mult("M15") > signals.stop_atr_mult("M5")
+        assert signals.stop_atr_mult() == signals.stop_atr_mult("M15")
+        assert signals.stop_atr_mult("nonsense") == signals._STOP_ATR_MULT
+
+        atr = 0.0010
+        kw = dict(pair="EUR_USD", bid=1.0999, ask=1.1001, spread_pips=1.0,
+                  indicators=_indicators(atr14=atr), session="London_NY_Overlap",
+                  h1_direction="LONG", h4_direction="LONG")
+        m5 = score_pair(timeframe="M5", **kw)
+        m15 = score_pair(timeframe="M15", **kw)
+        assert m15["prov_stop_pips"] > m5["prov_stop_pips"]
 
     def test_cost_ratio_is_reported_for_actionable_setups(self):
         out = score_pair(

@@ -1,7 +1,7 @@
 from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-from typing import List
+from typing import List, Optional
 
 from .config import AppSettings
 from .models import ForexSnapshot, ScanRequest, ScanSummary
@@ -17,6 +17,13 @@ from .signals import score_pair
 from .features import build_features, FEATURE_VERSION
 from .market_sessions import current_session, current_session_start_utc
 from .strength import calculate_strength, get_strength_for_pair, strength_bonus
+from . import quality as quality_gate
+from .alerts import AlertSink, build_alert, dispatch
+from .timeutil import hour_utc
+
+
+# Bars making up a ~4h session-context fallback, per signal timeframe.
+_SESSION_FALLBACK_BARS = {"M5": 48, "M15": 16, "H1": 4}
 
 
 def _apply_scoring(s: ForexSnapshot, scoring: dict) -> None:
@@ -63,6 +70,7 @@ def run_scan(
     settings: AppSettings,
     storage: Storage,
     request: ScanRequest,
+    alert_sinks: Optional[List[AlertSink]] = None,
 ) -> ScanSummary:
     client = OandaClient(settings)
     summary = ScanSummary()
@@ -79,7 +87,9 @@ def run_scan(
     # 2. Fetch candles per pair in parallel
     def _process_pair(pair: str):
         try:
-            bars = client.get_candles(pair, granularity="M5", count=200)
+            bars = client.get_candles(
+                pair, granularity=request.signal_timeframe, count=200,
+            )
             if not bars:
                 return pair, None, "No candle data", []
 
@@ -88,13 +98,16 @@ def run_scan(
 
             session = current_session()
 
-            # Session context: high/low since the active session opened. Falls back to a
-            # rolling 4h (48 M5 bars) window during Off_Hours or when no session bars exist.
+            # Session context: high/low since the active session opened. Falls back to
+            # a rolling ~4h window during Off_Hours or when no session bars exist —
+            # expressed in bars, so it stays 4 hours whatever the signal timeframe is.
             session_high, session_low = session_high_low(
                 bar_dicts, current_session_start_utc()
             )
             if session_high is None or session_low is None:
-                recent = bar_dicts[-48:] if len(bar_dicts) >= 48 else bar_dicts
+                fallback_bars = _SESSION_FALLBACK_BARS.get(request.signal_timeframe, 16)
+                recent = (bar_dicts[-fallback_bars:] if len(bar_dicts) >= fallback_bars
+                          else bar_dicts)
                 session_high = max(b["high"] for b in recent)
                 session_low = min(b["low"] for b in recent)
             indicators["session_high"] = session_high
@@ -156,6 +169,7 @@ def run_scan(
                 h1_direction=h1_direction,
                 h4_direction=h4_direction,
                 sr_levels=sr_levels,
+                timeframe=request.signal_timeframe,
             )
             ctx = {
                 "bid": bid, "ask": ask, "spread_pips": spread_pips,
@@ -260,18 +274,22 @@ def run_scan(
     # Final scoring pass: strength bonus folded into total_score, then the model
     # probability applied as a veto on anything the rules proposed.
     features_by_pair: dict = {}
+    verdicts_by_pair: dict = {}
+    pre_gate_signal_by_pair: dict = {}
+    scoring_by_pair: dict = {}
     for s in snapshots:
         ctx = ctx_by_pair.get(s.pair)
         if not ctx:
             continue
 
-        def _rescore(prob, bonus):
+        def _rescore(prob, bonus, verdict=None):
             return score_pair(
                 pair=s.pair, bid=ctx["bid"], ask=ctx["ask"],
                 spread_pips=ctx["spread_pips"], indicators=ctx["indicators"],
                 session=ctx["session"], max_spread_pips=request.max_spread_pips,
                 h1_direction=ctx["h1_direction"], h4_direction=ctx["h4_direction"],
                 sr_levels=ctx["sr_levels"], model_prob=prob, strength_bonus=bonus,
+                quality=verdict, timeframe=request.signal_timeframe,
             )
 
         # Strength alignment is judged against the raw directional read, not against
@@ -305,6 +323,27 @@ def run_scan(
             feats = build_features(feat_snap, direction)
             features_by_pair[s.pair] = feats
 
+            # Entry-quality gate. It needs the direction-relative feature vector, so
+            # it can only run here — after the first scoring pass has established a
+            # direction. On recorded history this is the single strongest filter in
+            # the pipeline (39.2% → 48.2% win rate), which is why it is applied
+            # unconditionally rather than, like the model, only when one is trained.
+            verdict = quality_gate.evaluate(
+                feats,
+                pair=s.pair,
+                hour_utc=hour_utc(ctx["as_of"]),
+                cost_ratio=scoring.get("cost_ratio"),
+            )
+            verdicts_by_pair[s.pair] = verdict
+
+            # The signal as it stands *without* the quality gate. This is what the
+            # forward-tracking ledger arms on — see the note at the arming block. It
+            # still carries every other veto, including the model's: an active model
+            # declining a setup is a decision not to take it, whereas the quality gate
+            # is a filter whose own thresholds have to stay falsifiable.
+            pre_gate_signal_by_pair[s.pair] = scoring.get("trade_signal")
+            scoring = _rescore(None, bonus, verdict)
+
             scorer = model or shadow_model
             if scorer is not None:
                 try:
@@ -314,13 +353,17 @@ def run_scan(
                     model_prob = None
                 if model_prob is not None:
                     if model is not None:
-                        scoring = _rescore(model_prob, bonus)
+                        scoring = _rescore(model_prob, bonus, verdict)
+                        pre_gate_signal_by_pair[s.pair] = (
+                            _rescore(model_prob, bonus, None).get("trade_signal")
+                        )
                     else:
                         # Shadow: record the probability and the bar it would have had
                         # to clear, but leave trade_signal exactly as the rules set it.
                         # Rescoring here would re-introduce the veto by the back door.
                         scoring = {**scoring, "model_prob": model_prob}
 
+        scoring_by_pair[s.pair] = scoring
         _apply_scoring(s, scoring)
 
     # Forward-evaluate previously-tracked signals against this scan's fresh bars,
@@ -330,7 +373,9 @@ def run_scan(
         pair_bars = bars_by_pair.get(s.pair) or []
         if pair_bars:
             try:
-                storage.evaluate_tracked_signals(s.pair, pair_bars)
+                storage.evaluate_tracked_signals(
+                    s.pair, pair_bars, max_hold_hours=request.max_hold_hours,
+                )
             except Exception as exc:
                 storage.log_pair(scan_id, s.pair, None, f"Tracking eval failed: {exc}")
 
@@ -338,36 +383,59 @@ def run_scan(
         if s.trade_signal not in ("AVOID", "WATCH_ONLY"):
             summary.signals_found += 1
 
+        # Forward-tracking arms on what the *rules* proposed, not on what survived
+        # the quality gate, and records the verdict alongside. Arming only gate-passers
+        # would censor the ledger exactly the way an active model censors its own
+        # evidence: the gate would only ever see outcomes for trades it already liked,
+        # so its thresholds could never be re-derived or falsified. Keeping the
+        # rejected setups in the ledger is what makes scripts/validate_gate.py able to
+        # answer "would the gate still have helped?" six months from now.
+        verdict = verdicts_by_pair.get(s.pair)
+        arm_signal = pre_gate_signal_by_pair.get(s.pair, s.trade_signal)
+        scoring = scoring_by_pair.get(s.pair, {})
+
+        # Levels: the live ones when the setup is actionable, otherwise the
+        # provisional ones the trade *would* have used. Same bracket either way —
+        # only whether it was recommended differs.
+        arm_entry = s.suggested_entry if s.suggested_entry is not None else scoring.get("prov_entry")
+        arm_stop = s.suggested_stop if s.suggested_stop is not None else scoring.get("prov_stop")
+        arm_target = s.suggested_target if s.suggested_target is not None else scoring.get("prov_target")
+        arm_stop_pips = s.stop_pips if s.stop_pips is not None else scoring.get("prov_stop_pips")
+        arm_target_pips = s.target_pips if s.target_pips is not None else scoring.get("prov_target_pips")
+
         # Thin-edge gate: don't forward-test signals whose target cannot clear the
         # round-trip cost by a sensible margin. The old 3× bar still left a third of
         # the target being paid away in spread; the cost_ratio veto in score_pair now
         # carries most of this, and 6× is the belt-and-braces check on the target side.
         thin_edge = (
             s.spread_pips is not None
-            and s.target_pips is not None
-            and s.target_pips < s.spread_pips * 6
+            and arm_target_pips is not None
+            and arm_target_pips < s.spread_pips * 6
         )
-        if thin_edge and s.trade_signal in _ACTIONABLE:
+        if thin_edge and arm_signal in _ACTIONABLE:
             storage.log_pair(scan_id, s.pair, None,
-                             f"Skipped tracking: target {s.target_pips}p < 6× spread")
+                             f"Skipped tracking: target {arm_target_pips}p < 6× spread")
         if (
-            s.trade_signal in _ACTIONABLE
-            and s.suggested_stop is not None
-            and s.suggested_target is not None
+            arm_signal in _ACTIONABLE
+            and arm_stop is not None
+            and arm_target is not None
             and pair_bars
             and not thin_edge
         ):
-            direction = -1 if "SHORT" in s.trade_signal else 1
+            direction = -1 if "SHORT" in arm_signal else 1
             try:
                 storage.record_tracked_signal(
                     pair=s.pair,
-                    signal=s.trade_signal,
+                    signal=arm_signal,
                     direction=direction,
-                    entry=s.suggested_entry,
-                    stop=s.suggested_stop,
-                    target=s.suggested_target,
-                    stop_pips=s.stop_pips or 0.0,
-                    target_pips=s.target_pips or 0.0,
+                    entry=arm_entry,
+                    stop=arm_stop,
+                    target=arm_target,
+                    stop_pips=arm_stop_pips or 0.0,
+                    target_pips=arm_target_pips or 0.0,
+                    quality_passed=None if verdict is None else verdict.passed,
+                    quality_reason=None if verdict is None else verdict.reason,
+                    extension_score=None if verdict is None else verdict.extension_score,
                     atr14=s.atr14 or 0.0,
                     entry_ts=pair_bars[-1]["timestamp"],
                     # The feature vector as it stood when the trade was armed. This is
@@ -389,6 +457,38 @@ def run_scan(
                 )
             except Exception as exc:
                 storage.log_pair(scan_id, s.pair, None, f"Tracking record failed: {exc}")
+
+    # ── Alerts ──────────────────────────────────────────────────────────────
+    # Raised only for setups that survived every gate above. Persisting happens
+    # first and delivery second, so an alert that was raised is recorded even if
+    # every sink is unreachable — the dashboard feed stays the source of truth and
+    # the webhook is a convenience on top of it.
+    new_alerts = []
+    for s in snapshots:
+        alert = build_alert(s, verdicts_by_pair.get(s.pair))
+        if alert is None:
+            continue
+        try:
+            alert_id = storage.record_alert(alert)
+        except Exception as exc:
+            storage.log_pair(scan_id, s.pair, None, f"Alert record failed: {exc}")
+            continue
+        if alert_id is None:
+            continue          # inside the dedupe window
+        new_alerts.append((alert_id, alert))
+
+    if new_alerts and alert_sinks:
+        report = dispatch([a for _, a in new_alerts], alert_sinks)
+        errors_by_pair = {}
+        for err in report["errors"]:
+            sink_pair, _, detail = err.partition(": ")
+            errors_by_pair[sink_pair.split("/")[-1]] = detail or err
+        for alert_id, alert in new_alerts:
+            storage.mark_alert_delivered(alert_id, errors_by_pair.get(alert.pair))
+        for err in report["errors"]:
+            storage.log_pair(scan_id, "ALERT", None, f"Alert delivery failed: {err}")
+
+    summary.alerts_raised = len(new_alerts)
 
     # Sort by score descending (after strength adjustment)
     snapshots.sort(key=lambda s: s.total_score, reverse=True)

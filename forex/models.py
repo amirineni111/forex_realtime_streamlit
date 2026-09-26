@@ -95,9 +95,22 @@ class ScanRequest(BaseModel):
     pairs: List[str]
     max_spread_pips: float = 2.0
     signal_mode: str = "All"
+    # Bars the signal is computed on. M5 was the original choice and is measurably
+    # the wrong one: M5 ATR on a major is 2-4 pips, so a stop wide enough to amortise
+    # a ~1.6 pip spread sits 5-10x outside the signal's own horizon. Backtested over
+    # 9 months (scripts/backtest.py), M5 setups are vetoed on cost 100% of the time
+    # once the cost gate is honest, while M15 carries a positive gross edge.
+    signal_timeframe: str = "M15"
+    # Hours a tracked bracket may stay open before it is closed at market. Scales with
+    # the timeframe: an M15 bracket at 5xATR is ~27 pips out and needs room to resolve.
+    max_hold_hours: float = 24.0
 
 
 class ScanSummary(BaseModel):
     pairs_scanned: int = 0
     errors: int = 0
     signals_found: int = 0
+    # Setups that cleared the entry-quality gate and were pushed as alerts. Always
+    # ≤ signals_found, and typically far below it — the gate keeps about a fifth of
+    # what the rules propose, which is the point of having it.
+    alerts_raised: int = 0

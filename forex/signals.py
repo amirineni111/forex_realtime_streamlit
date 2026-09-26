@@ -1,8 +1,11 @@
 from __future__ import annotations
 import json
-from typing import List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 from .market_sessions import current_session
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from .quality import QualityVerdict
 
 
 def _macd_magnitude_pts(macd_histogram: float, atr14: Optional[float], macd: Optional[float]) -> float:
@@ -306,20 +309,57 @@ def _sr_proximity(
 _ADX_TREND = 25.0
 _ADX_RANGE = 18.0
 
-# ATR multiples for suggested stop/target. Reward:risk stays fixed — the target is
-# derived from the final stop distance, so widening the stop widens the target too.
-_STOP_ATR_MULT = 1.5
+# ATR multiples for suggested stop/target, by signal timeframe. Reward:risk stays
+# fixed — the target is derived from the final stop distance, so widening the stop
+# widens the target too.
+#
+# These are not interchangeable, because ATR is a property of the bar size. M5 ATR on
+# a major is 2-4 pips, so the 1.5x that looked reasonable there produced a stop inside
+# the spread's own noise; M15 ATR is ~5-6 pips, and 5x puts the stop around 27 pips —
+# far enough out that a ~1.6 pip spread is 6% of risk rather than 12.5%.
+#
+# Values come from scripts/backtest.py sweeping the multiple over 9 months of bars
+# (2026-01-01 to 2026-09-25, 7 tight-spread majors, full bar-by-bar coverage). On M15
+# gross R peaks near 5x (+0.061R) and decays past 7x as the stop drifts away from any
+# level the market respects; cost falls monotonically, so 5x is where the two curves
+# cross best.
+_STOP_ATR_MULT_BY_TF = {"M5": 1.5, "M15": 5.0, "H1": 3.0}
+_DEFAULT_TIMEFRAME = "M15"
+_STOP_ATR_MULT = _STOP_ATR_MULT_BY_TF[_DEFAULT_TIMEFRAME]
 _RR = 1.5
+
+
+def stop_atr_mult(timeframe: Optional[str] = None) -> float:
+    """Bracket scale for a signal timeframe, falling back to the default."""
+    return _STOP_ATR_MULT_BY_TF.get(timeframe or _DEFAULT_TIMEFRAME, _STOP_ATR_MULT)
 # Noise floor for the stop: 1×ATR on M5 is often just 2-4 pips, which sits inside
 # ordinary spread noise and gets tagged within minutes. Never risk less than this.
 _MIN_STOP_PIPS = 8.0
 
-# Transaction cost is the dominant term at this timeframe. Measured over 910
-# recorded outcomes: an average 2.23-pip spread against a 9.39-pip stop burned
-# 0.237R per round trip — more than any plausible edge in the score. The stop must
-# therefore scale with the spread so the cost ratio stays bounded.
-_SPREAD_STOP_MULT = 8.0   # stop ≥ 8× spread ⇒ cost ≤ 12.5% of risk
-_MAX_COST_RATIO = 0.15    # hard veto above this; nothing actionable survives it
+# Transaction cost is the dominant term at this timeframe, and the way it used to be
+# handled was circular. The stop was defined as ``max(..., 8 × spread)`` and the veto
+# then rejected anything with ``cost_ratio > 0.15`` — but a stop that is always at
+# least 8× the spread has a cost ratio of at most 1/8 = 0.125 *by construction*, so
+# the veto could never fire. It was dead code, and the effect was that every setup,
+# however wide its spread, was silently handed a stop wide enough to make its cost
+# look acceptable. Measured consequence: the spread floor bound on 772 of 846 trades
+# and pinned the cost ratio at exactly 12.5% — which is 0.1224R of guaranteed drag
+# against a *gross* edge of -0.0506R.
+#
+# The sizing is now two-stage and the veto is live:
+#   1. a volatility stop — what the market's own noise level demands;
+#   2. widened, if needed, toward the distance that bounds cost at _MAX_COST_RATIO;
+#   3. but never past _MAX_STOP_WIDEN_RATIO × the timeframe's own bracket scale,
+#      because a stop far outside the pair's current volatility is no longer the
+#      same trade;
+#   4. and if cost is *still* over the limit at that ceiling, the setup is vetoed.
+#
+# So the veto now fires exactly when it should: when the spread is too wide for the
+# pair's current volatility to amortise. The ratio is expressed relative to the
+# timeframe's base multiple rather than as an absolute ATR count, so it means the
+# same thing ("widen by up to ~2.4x before giving up") on every timeframe.
+_MAX_STOP_WIDEN_RATIO = 2.4
+_MAX_COST_RATIO = 0.10    # cost ≤ 10% of risk ⇒ breakeven win rate 44.0% at RR 1.5
 
 # How far above cost-adjusted breakeven a modelled probability must sit before the
 # trade is worth taking. Trading at exactly breakeven just donates the spread to
@@ -372,16 +412,22 @@ def _trade_levels(
     atr14: Optional[float],
     pair: str,
     spread_pips: Optional[float] = None,
+    timeframe: Optional[str] = None,
 ) -> dict:
     """ATR-based stop/target/RR for an actionable direction. Empty dict if not computable."""
     if direction not in ("LONG", "SHORT") or not entry or not atr14 or atr14 <= 0:
         return {}
     pip = 0.01 if "JPY" in pair else 0.0001
-    stop_dist = max(
-        _STOP_ATR_MULT * atr14,
-        _MIN_STOP_PIPS * pip,
-        (spread_pips or 0.0) * _SPREAD_STOP_MULT * pip,
-    )
+
+    atr_mult = stop_atr_mult(timeframe)
+    # 1. What the market's noise level demands.
+    vol_stop = max(atr_mult * atr14, _MIN_STOP_PIPS * pip)
+    # 2. What bounding the cost ratio would demand.
+    cost_stop = (spread_pips or 0.0) / _MAX_COST_RATIO * pip
+    # 3. How far we are willing to widen before it stops being the same trade.
+    ceiling = max(_MAX_STOP_WIDEN_RATIO * atr_mult * atr14, _MIN_STOP_PIPS * pip)
+    stop_dist = min(max(vol_stop, cost_stop), ceiling)
+
     tgt_dist = _RR * stop_dist
     if direction == "LONG":
         stop = entry - stop_dist
@@ -412,6 +458,8 @@ def score_pair(
     sr_levels: Optional[list] = None,
     model_prob: Optional[float] = None,
     strength_bonus: float = 0.0,
+    quality: Optional["QualityVerdict"] = None,
+    timeframe: Optional[str] = None,
 ) -> dict:
     """
     Compute all signal scores and produce final trade_signal.
@@ -421,6 +469,12 @@ def score_pair(
     one is available. It acts as a veto, never as a promoter: the rule-based score
     still has to propose the setup, and the model decides whether the measured odds
     justify paying the spread.
+
+    ``quality`` is a ``forex.quality.QualityVerdict`` for the setup, supplied by the
+    caller once the direction-relative feature vector exists. Like ``model_prob`` it
+    only ever demotes. It is the strongest filter in the ladder — on recorded history
+    it is what separates a 39.2% win rate from a 48.2% one — so it is checked before
+    the softer structural vetoes.
     """
     close = indicators.get("close")
     rsi14 = indicators.get("rsi14")
@@ -487,7 +541,7 @@ def score_pair(
 
     # Cost ratio: spread as a fraction of the risk being taken. Computed from the
     # stop we would actually use, so it reflects the real drag on expectancy.
-    provisional = _trade_levels(dominant, entry_px, atr14, pair, spread_pips)
+    provisional = _trade_levels(dominant, entry_px, atr14, pair, spread_pips, timeframe)
     prov_stop_pips = provisional.get("stop_pips") or 0.0
     cost_ratio = round(spread_pips / prov_stop_pips, 4) if (
         spread_pips is not None and prov_stop_pips > 0
@@ -523,6 +577,9 @@ def score_pair(
     elif cost_veto:
         trade_signal = "AVOID"
         reason = f"Cost {cost_ratio:.0%} of risk exceeds {_MAX_COST_RATIO:.0%} limit"
+    elif quality is not None and not quality.passed and total >= 45:
+        trade_signal = "WATCH_ONLY"
+        reason = f"{dominant} setup ({total:.0f}pts) but entry quality failed: {quality.reason}"
     elif h1_opposes and total >= 45:
         trade_signal = "WATCH_ONLY"
         reason = f"{dominant} setup ({total:.0f}pts) but H1 trend is {h1_direction} — countertrend"
@@ -566,7 +623,7 @@ def score_pair(
 
     # ATR-based stop/target/RR for actionable directions
     entry = entry_px
-    levels = _trade_levels(dominant, entry, atr14, pair, spread_pips) if trade_signal not in (
+    levels = _trade_levels(dominant, entry, atr14, pair, spread_pips, timeframe) if trade_signal not in (
         "AVOID", "WATCH_ONLY"
     ) else {}
 
@@ -606,8 +663,16 @@ def score_pair(
         "model_prob": model_prob,
         "required_prob": required_p,
         "dominant": dominant,
+        "quality_passed": None if quality is None else quality.passed,
+        "quality_reason": None if quality is None else quality.reason,
+        "extension_score": None if quality is None else quality.extension_score,
         # Levels the trade *would* use, exposed even when the signal is not actionable
-        # so feature extraction always sees a real stop size rather than a zero.
+        # so feature extraction always sees a real stop size rather than a zero, and
+        # so the forward-tracking ledger can record gate-rejected setups. Tracking
+        # only what passes would censor the evidence the gate is judged by.
+        "prov_entry": provisional.get("suggested_entry"),
+        "prov_stop": provisional.get("suggested_stop"),
+        "prov_target": provisional.get("suggested_target"),
         "prov_stop_pips": provisional.get("stop_pips"),
         "prov_target_pips": provisional.get("target_pips"),
         "total_score": round(total, 1),

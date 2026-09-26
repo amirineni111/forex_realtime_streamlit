@@ -17,6 +17,7 @@ import pytest
 from forex.config import AppSettings
 from forex.features import FEATURE_NAMES, FEATURE_VERSION
 from forex.model import fit
+from forex.alerts import CallableSink
 from forex.models import ForexBar, ForexQuote, ScanRequest
 from forex.storage import Storage
 import forex.scanner as scanner_mod
@@ -25,18 +26,33 @@ from forex.scanner import run_scan
 
 PAIRS = ["EUR_USD", "GBP_USD", "USD_JPY"]
 BASE = {"EUR_USD": 1.1000, "GBP_USD": 1.2700, "USD_JPY": 150.00}
-GRAN_MINUTES = {"M5": 5, "H1": 60, "H4": 240}
+GRAN_MINUTES = {"M5": 5, "M15": 15, "H1": 60, "H4": 240}
 
 
-def _make_bars(pair: str, granularity: str, count: int, slope: float = 1.0):
-    """A clean uptrend with mild oscillation — enough for every indicator to resolve."""
+def _make_bars(
+    pair: str, granularity: str, count: int, slope: float = 1.0,
+    pullback_bars: int = 0, pullback_mult: float = 1.0,
+):
+    """
+    A clean uptrend with mild oscillation — enough for every indicator to resolve.
+
+    ``pullback_bars`` retraces the last N bars against the trend. A pure uptrend is
+    exactly the "extended" entry that ``forex.quality`` now rejects, so a stub that
+    only ever produced one could no longer exercise the arming path at all. A trend
+    that has pulled back into its own structure is the shape the gate is built to
+    accept, and is what the actionable-signal tests use.
+    """
     px = BASE[pair]
     tick = 0.01 if "JPY" in pair else 0.0001
     step = timedelta(minutes=GRAN_MINUTES[granularity])
     start = datetime(2026, 7, 27, 0, 0, tzinfo=timezone.utc) - step * count
+    peak = count - pullback_bars
     bars = []
     for i in range(count):
-        drift = slope * i * tick * 0.6
+        if i < peak:
+            drift = slope * i * tick * 0.6
+        else:
+            drift = slope * peak * tick * 0.6 - (i - peak) * tick * pullback_mult
         wobble = math.sin(i / 4.0) * tick * 1.5
         close = px + drift + wobble
         high = close + tick * 2
@@ -52,15 +68,22 @@ def _make_bars(pair: str, granularity: str, count: int, slope: float = 1.0):
 class StubOanda:
     """Deterministic stand-in for OandaClient — no network, no credentials."""
 
-    def __init__(self, settings=None, spread_pips: float = 1.0):
+    def __init__(self, settings=None, spread_pips: float = 1.0, pullback_bars: int = 0,
+                 signal_timeframe: str = "M15"):
         self.spread_pips = spread_pips
+        self.pullback_bars = pullback_bars
+        # Which granularity carries the pullback. Must track the scanner's signal
+        # timeframe, otherwise the retrace lands on bars nothing is scored from and
+        # every gate-passing test silently stops exercising the arming path.
+        self.signal_timeframe = signal_timeframe
         self.candle_calls = 0
 
     def get_pricing(self, pairs):
         quotes = []
         for p in pairs:
             tick = 0.01 if "JPY" in p else 0.0001
-            bars = _make_bars(p, "M5", 200)
+            bars = _make_bars(p, self.signal_timeframe, 200,
+                              pullback_bars=self.pullback_bars)
             mid = bars[-1].close
             half = self.spread_pips * tick / 2
             quotes.append(ForexQuote(
@@ -72,7 +95,11 @@ class StubOanda:
 
     def get_candles(self, pair, granularity="M5", count=200):
         self.candle_calls += 1
-        return _make_bars(pair, granularity, count)
+        # Only the signal timeframe carries the pullback: H1/H4 stay trending so the
+        # MTF gate still confirms the direction, which is the realistic shape of a
+        # buy-the-dip setup.
+        pullback = self.pullback_bars if granularity == self.signal_timeframe else 0
+        return _make_bars(pair, granularity, count, pullback_bars=pullback)
 
 
 @pytest.fixture
@@ -123,12 +150,61 @@ class TestScanEndToEnd:
             if s["trade_signal"] == "STRONG_BUY":
                 assert s["mtf_score"] >= 15
 
-    def test_armed_signals_store_a_full_feature_vector(self, env):
+    def test_extended_trend_is_gated_out(self, env, monkeypatch):
+        """
+        A pure uptrend is the extended entry the quality gate exists to reject.
+
+        Measured over 1,003 trades carrying features, entries in the top quintile of
+        every momentum axis won 30-34% against the 45% that RR 1.5 needs at the cost
+        being paid. Nothing should arm off this shape.
+        """
         settings, storage = env
+        monkeypatch.setattr(scanner_mod, "OandaClient",
+                            lambda s: StubOanda(s, pullback_bars=0))
+        _run(settings, storage)
+
+        snaps = storage.load_latest_snapshots()
+        assert all(s["trade_signal"] in ("AVOID", "WATCH_ONLY") for s in snaps)
+        assert any("entry quality failed" in (s["signal_reason"] or "") for s in snaps)
+
+    def test_gate_rejected_setups_are_still_tracked_for_evidence(self, env, monkeypatch):
+        """
+        Rejected setups stay in the forward-tracking ledger, flagged as rejected.
+
+        Arming only what the gate passes would censor its own evidence: the gate
+        would see outcomes exclusively for trades it already liked, so its thresholds
+        could never be re-derived or falsified. scripts/validate_gate.py depends on
+        the rejected rows being there to answer "would the gate still have helped?".
+        """
+        settings, storage = env
+        monkeypatch.setattr(scanner_mod, "OandaClient",
+                            lambda s: StubOanda(s, pullback_bars=0))
+        _run(settings, storage)
+
+        tracked = storage.load_tracked_signals("open")
+        assert tracked, "gate-rejected setups must still be tracked"
+        for row in tracked:
+            assert row["quality_passed"] == 0
+            assert row["quality_reason"]
+            assert row["extension_score"] is not None
+            # A rejected setup is still a complete, resolvable bracket.
+            assert row["entry_price"] and row["stop_price"] and row["target_price"]
+
+    def test_gate_passed_setups_are_flagged_as_passed(self, env, monkeypatch):
+        settings, storage = env
+        monkeypatch.setattr(scanner_mod, "OandaClient",
+                            lambda s: StubOanda(s, pullback_bars=6))
         _run(settings, storage)
         tracked = storage.load_tracked_signals("open")
-        if not tracked:
-            pytest.skip("stub data produced no actionable signal")
+        assert any(row["quality_passed"] == 1 for row in tracked)
+
+    def test_armed_signals_store_a_full_feature_vector(self, env, monkeypatch):
+        settings, storage = env
+        monkeypatch.setattr(scanner_mod, "OandaClient",
+                            lambda s: StubOanda(s, pullback_bars=6))
+        _run(settings, storage)
+        tracked = storage.load_tracked_signals("open")
+        assert tracked, "pullback stub should produce at least one actionable signal"
         for row in tracked:
             feats = json.loads(row["features_json"])
             assert set(feats) == set(FEATURE_NAMES)
@@ -213,3 +289,91 @@ class TestModelInTheLoop:
         summary = _run(settings, storage)
         assert summary.pairs_scanned == len(PAIRS)
         assert summary.errors == 0
+
+
+class TestAlertsEndToEnd:
+    """
+    The alerting path, exercised through a real scan rather than in isolation.
+
+    An alert means every gate passed, so these also serve as the end-to-end proof
+    that the quality gate is wired into the scan at all.
+    """
+
+    def _run_with_sinks(self, settings, storage, sinks, pullback_bars=6, **kw):
+        return run_scan(
+            settings, storage,
+            ScanRequest(pairs=PAIRS, **kw),
+            alert_sinks=sinks,
+        )
+
+    def test_qualifying_setup_raises_and_persists_an_alert(self, env, monkeypatch):
+        settings, storage = env
+        monkeypatch.setattr(scanner_mod, "OandaClient",
+                            lambda s: StubOanda(s, pullback_bars=6))
+        received = []
+        summary = self._run_with_sinks(settings, storage,
+                                       [CallableSink(received.append, "spy")])
+
+        assert summary.alerts_raised > 0
+        stored = storage.load_alerts()
+        assert len(stored) == summary.alerts_raised
+        assert len(received) == summary.alerts_raised
+        row = stored[0]
+        assert row["entry"] and row["stop"] and row["target"]
+        assert row["delivered"] == 1
+        assert row["delivery_error"] is None
+
+    def test_extended_trend_raises_no_alert(self, env, monkeypatch):
+        settings, storage = env
+        monkeypatch.setattr(scanner_mod, "OandaClient",
+                            lambda s: StubOanda(s, pullback_bars=0))
+        received = []
+        summary = self._run_with_sinks(settings, storage,
+                                       [CallableSink(received.append, "spy")])
+        assert summary.alerts_raised == 0
+        assert received == []
+        assert storage.load_alerts() == []
+
+    def test_alerts_never_exceed_signals_found(self, env, monkeypatch):
+        settings, storage = env
+        monkeypatch.setattr(scanner_mod, "OandaClient",
+                            lambda s: StubOanda(s, pullback_bars=6))
+        summary = self._run_with_sinks(settings, storage, [])
+        assert summary.alerts_raised <= summary.signals_found
+
+    def test_rescanning_does_not_re_alert_the_same_setup(self, env, monkeypatch):
+        """
+        The scanner re-runs every 30-60s. Without dedupe the same valid setup would
+        re-fire on every tick, which is how an operator learns to ignore alerts.
+        """
+        settings, storage = env
+        monkeypatch.setattr(scanner_mod, "OandaClient",
+                            lambda s: StubOanda(s, pullback_bars=6))
+        first = self._run_with_sinks(settings, storage, [])
+        second = self._run_with_sinks(settings, storage, [])
+        assert first.alerts_raised > 0
+        assert second.alerts_raised == 0
+        assert len(storage.load_alerts()) == first.alerts_raised
+
+    def test_a_dead_webhook_does_not_fail_the_scan(self, env, monkeypatch):
+        """
+        Alerting is a side-channel. The scan is also writing tracked signals and
+        outcomes, and must complete even when every sink is unreachable.
+        """
+        settings, storage = env
+        monkeypatch.setattr(scanner_mod, "OandaClient",
+                            lambda s: StubOanda(s, pullback_bars=6))
+
+        def boom(_alert):
+            raise RuntimeError("connection refused")
+
+        summary = self._run_with_sinks(settings, storage,
+                                       [CallableSink(boom, "dead")])
+        assert summary.errors == 0
+        assert summary.pairs_scanned == len(PAIRS)
+        assert summary.alerts_raised > 0
+        # Raised and recorded even though delivery failed.
+        rows = storage.load_alerts()
+        assert len(rows) == summary.alerts_raised
+        assert all(r["delivered"] == 0 for r in rows)
+        assert all("connection refused" in (r["delivery_error"] or "") for r in rows)

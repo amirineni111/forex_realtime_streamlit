@@ -15,7 +15,18 @@ EXOTIC_PAIRS: List[str] = [
     "USD_DKK", "USD_HKD",
 ]
 
+# Pairs whose spread is small enough that a bracket can amortise it. Measured median
+# spreads: all are <= 1.8 pips, against the 2.3-3.5 pips of everything excluded. At a
+# ~27 pip M15 stop that is 5-7% of risk rather than 9-13%, which is the difference
+# between a breakeven system and a losing one. Backtested over 9 months, restricting
+# to these lifted expectancy from -0.002R (all 14 pairs) to +0.024R.
+TIGHT_SPREAD_PAIRS: List[str] = [
+    "EUR_USD", "GBP_USD", "USD_JPY", "USD_CHF",
+    "USD_CAD", "AUD_USD", "EUR_GBP",
+]
+
 UNIVERSE_MAP = {
+    "Tight spread (recommended)": TIGHT_SPREAD_PAIRS,
     "Majors": MAJOR_PAIRS,
     "Majors + Minors": MAJOR_PAIRS + MINOR_PAIRS,
     "All": MAJOR_PAIRS + MINOR_PAIRS + EXOTIC_PAIRS,

@@ -196,6 +196,38 @@ class Storage:
                 -- Every attempt to reach SQL Server / OANDA for ML data, including
                 -- failures. Throttling reads this: without logging failures, an
                 -- unreachable server would be dialled on every 60s refresh.
+                -- Setups that cleared the entry-quality gate and were pushed as
+                -- near-real-time alerts. Kept separately from forex_signal_tracking
+                -- because an alert is a *notification* event: it has its own dedupe
+                -- window and its own delivery status, and one tracked signal can
+                -- legitimately produce no alert (gate rejected it) while an alert
+                -- always corresponds to something the gate passed.
+                CREATE TABLE IF NOT EXISTS forex_alerts (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at      TEXT DEFAULT CURRENT_TIMESTAMP,
+                    pair            TEXT NOT NULL,
+                    direction       INTEGER,
+                    signal          TEXT,
+                    urgency         TEXT,
+                    entry           REAL,
+                    stop            REAL,
+                    target          REAL,
+                    stop_pips       REAL,
+                    target_pips     REAL,
+                    rr_ratio        REAL,
+                    spread_pips     REAL,
+                    cost_ratio      REAL,
+                    total_score     REAL,
+                    regime          TEXT,
+                    session         TEXT,
+                    extension_score REAL,
+                    reason          TEXT,
+                    payload_json    TEXT,
+                    delivered       INTEGER DEFAULT 0,
+                    delivery_error  TEXT,
+                    acknowledged_at TEXT
+                );
+
                 CREATE TABLE IF NOT EXISTS ml_sync_log (
                     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
                     kind                TEXT,
@@ -276,6 +308,13 @@ class Storage:
                 # censored sample (only trades it allowed exist), so they cannot be
                 # pooled with shadow rows when judging the model.
                 ("model_mode", "TEXT"),
+                # The entry-quality verdict at arm time. Setups the gate rejected are
+                # still tracked — arming only what passes would censor the ledger the
+                # same way an active model censors its own evidence, leaving the gate's
+                # thresholds impossible to re-derive or falsify later.
+                ("quality_passed", "INTEGER"),
+                ("quality_reason", "TEXT"),
+                ("extension_score", "REAL"),
             ],
             # Shadow mode: a model scores every setup and logs its probability but
             # never vetoes. An active model only ever gets outcomes for the trades it
@@ -598,6 +637,9 @@ class Storage:
         regime: Optional[str] = None,
         session: Optional[str] = None,
         model_mode: Optional[str] = None,
+        quality_passed: Optional[bool] = None,
+        quality_reason: Optional[str] = None,
+        extension_score: Optional[float] = None,
     ) -> Optional[int]:
         """
         Record an actionable signal for hands-off forward evaluation. Skips if an
@@ -625,15 +667,85 @@ class Storage:
                 "(pair,signal,direction,entry_price,stop_price,target_price,"
                 "stop_pips,target_pips,atr14,entry_ts,"
                 "features_json,feature_version,model_prob,required_prob,cost_ratio,"
-                "spread_pips,total_score,adx14,regime,session,model_mode) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "spread_pips,total_score,adx14,regime,session,model_mode,"
+                "quality_passed,quality_reason,extension_score) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (pair, signal, direction, entry, stop, target,
                  stop_pips, target_pips, atr14, entry_ts,
                  json.dumps(features) if features else None, feature_version,
                  model_prob, required_prob, cost_ratio,
-                 spread_pips, total_score, adx14, regime, session, model_mode),
+                 spread_pips, total_score, adx14, regime, session, model_mode,
+                 None if quality_passed is None else int(quality_passed),
+                 quality_reason, extension_score),
             )
             return cur.lastrowid
+
+    # ── Alerts ──────────────────────────────────────────────────────────────
+
+    ALERT_COOLDOWN_MINUTES = 45
+
+    def record_alert(self, alert, cooldown_minutes: Optional[int] = None) -> Optional[int]:
+        """
+        Persist an alert unless the same pair+direction was already alerted inside the
+        cooldown window.
+
+        Deduping here rather than at the sink is deliberate: the scanner re-runs every
+        30-60 seconds and would otherwise re-fire the same setup on every tick for as
+        long as it stays valid, which is precisely the behaviour that trains someone to
+        ignore the alerts. Returns the new row id, or None when suppressed.
+        """
+        window = self.ALERT_COOLDOWN_MINUTES if cooldown_minutes is None else cooldown_minutes
+        with self._connect() as conn:
+            # A zero/negative window means "no dedupe" and has to be handled here
+            # rather than in SQL: datetime('now', '-0 minutes') is simply now, and
+            # CURRENT_TIMESTAMP has one-second resolution, so the comparison would
+            # still match a row written in the same second.
+            existing = None if window <= 0 else conn.execute(
+                "SELECT 1 FROM forex_alerts WHERE pair=? AND direction=? "
+                "AND created_at >= datetime('now', ?) LIMIT 1",
+                (alert.pair, alert.direction, f"-{int(window)} minutes"),
+            ).fetchone()
+            if existing:
+                return None
+            cur = conn.execute(
+                "INSERT INTO forex_alerts "
+                "(pair,direction,signal,urgency,entry,stop,target,stop_pips,target_pips,"
+                " rr_ratio,spread_pips,cost_ratio,total_score,regime,session,"
+                " extension_score,reason,payload_json) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (alert.pair, alert.direction, alert.signal, alert.urgency,
+                 alert.entry, alert.stop, alert.target, alert.stop_pips,
+                 alert.target_pips, alert.rr_ratio, alert.spread_pips,
+                 alert.cost_ratio, alert.total_score, alert.regime, alert.session,
+                 alert.extension_score, alert.reason, json.dumps(alert.to_dict())),
+            )
+            return cur.lastrowid
+
+    def mark_alert_delivered(self, alert_id: int, error: Optional[str] = None) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE forex_alerts SET delivered=?, delivery_error=? WHERE id=?",
+                (0 if error else 1, error, alert_id),
+            )
+
+    def load_alerts(self, limit: int = 50, since_minutes: Optional[int] = None) -> list:
+        """Most recent alerts first. ``since_minutes`` restricts to a recent window."""
+        sql = "SELECT * FROM forex_alerts"
+        params: list = []
+        if since_minutes is not None:
+            sql += " WHERE created_at >= datetime('now', ?)"
+            params.append(f"-{int(since_minutes)} minutes")
+        sql += " ORDER BY created_at DESC, id DESC LIMIT ?"
+        params.append(limit)
+        with self._connect() as conn:
+            return [dict(r) for r in conn.execute(sql, params).fetchall()]
+
+    def acknowledge_alert(self, alert_id: int) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE forex_alerts SET acknowledged_at=? WHERE id=?",
+                (datetime.now(timezone.utc).isoformat(), alert_id),
+            )
 
     def evaluate_tracked_signals(
         self, pair: str, bars: List[dict], max_hold_hours: float = 12.0,

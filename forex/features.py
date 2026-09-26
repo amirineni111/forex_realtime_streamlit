@@ -53,7 +53,20 @@ FEATURE_NAMES: Sequence[str] = (
     "sess_asian",
 )
 
-FEATURE_VERSION = 1
+# Bumped 1 -> 2 when the signal timeframe moved from M5 to M15.
+#
+# The feature *names* did not change, which is exactly why this bump is necessary
+# rather than optional: every ATR-normalised ratio, the RSI, the session-range
+# position and the stop size all mean something different on a 15-minute bar than on
+# a 5-minute one. M5 ATR on a major is 2-4 pips and M15 is roughly 3x that, so an
+# identically-named feature is drawn from a different distribution.
+#
+# Pooling the two would train a model on a mixture of two populations and then serve
+# it to one of them. Since ``load_training_rows`` filters on this column, the bump is
+# what keeps the ~1,000 M5-era rows out of the next retrain, and it also invalidates
+# the stored M5 model (walk-forward AUC 0.484 — below chance) rather than letting it
+# be served against inputs it never saw.
+FEATURE_VERSION = 2
 
 # Cap for ATR-normalised ratios. Without this a near-zero ATR turns one bar into
 # an enormous outlier that dominates a linear model's fit.
