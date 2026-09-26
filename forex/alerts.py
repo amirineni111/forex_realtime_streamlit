@@ -21,7 +21,9 @@ Sinks are pluggable and every one of them is best-effort: a webhook that is down
 must never take the scan with it, so ``dispatch`` catches per-sink failures and
 reports them rather than raising. ``WebhookSink`` posts a JSON body that Slack and
 Discord both accept (both read ``text``/``content``), and carries the full
-structured payload alongside so a custom consumer has everything.
+structured payload alongside so a custom consumer has everything. ``NtfySink``
+sends plain text with headers for free phone push via the ntfy app; ``make_sink``
+picks between them from the URL.
 """
 from __future__ import annotations
 
@@ -29,6 +31,7 @@ import json
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Callable, List, Optional, Sequence
+from urllib.parse import urlparse
 
 import httpx
 
@@ -217,6 +220,80 @@ class WebhookSink(AlertSink):
         with httpx.Client(timeout=self.timeout) as client:
             resp = client.post(self.url, json=payload)
             resp.raise_for_status()
+
+
+class NtfySink(AlertSink):
+    """
+    Phone push through ntfy (``https://ntfy.sh/<topic>`` or a self-hosted server).
+
+    ntfy shows the POST body verbatim, so the JSON that ``WebhookSink`` sends would
+    arrive as a wall of braces. It gets plain text instead, with the headline in the
+    ``Title`` header -- HTTP headers must be ASCII, so the title is kept that way --
+    and HIGH-urgency alerts at ntfy's ``high`` priority, which rings through
+    notification summaries on iOS.
+    """
+
+    name = "ntfy"
+
+    def __init__(self, url: str, timeout: float = 10.0) -> None:
+        self.url = url
+        self.timeout = timeout
+
+    @staticmethod
+    def title(alert: Alert) -> str:
+        bits = [alert.side, alert.pair.replace("_", "/")]
+        if alert.entry is not None:
+            bits.append(f"@ {alert.entry:g}")
+        if alert.urgency == URGENCY_HIGH:
+            bits.append("[HIGH]")
+        return " ".join(bits)
+
+    def request(self, alert: Alert) -> httpx.Request:
+        headers = {
+            "Title": self.title(alert).encode("ascii", "replace").decode(),
+            "Priority": "high" if alert.urgency == URGENCY_HIGH else "default",
+            "Tags": "chart_with_upwards_trend" if alert.direction > 0
+            else "chart_with_downwards_trend",
+        }
+        return httpx.Request("POST", self.url, content=alert.body().encode("utf-8"),
+                             headers=headers)
+
+    def send(self, alert: Alert) -> None:
+        with httpx.Client(timeout=self.timeout) as client:
+            resp = client.send(self.request(alert))
+            resp.raise_for_status()
+
+
+def make_sink(url: str) -> Optional[AlertSink]:
+    """The right sink for a push URL: ntfy gets plain text, everything else JSON."""
+    url = (url or "").strip()
+    if not url:
+        return None
+    if "ntfy" in (urlparse(url).netloc or "").lower():
+        return NtfySink(url)
+    return WebhookSink(url)
+
+
+def send_test(url: str, title: str, message: str, timeout: float = 10.0) -> Optional[str]:
+    """
+    One free-form message to ``url`` to check delivery. Returns None on success,
+    else a short error string -- never raises.
+    """
+    sink = make_sink(url)
+    if sink is None:
+        return "no URL configured"
+    try:
+        with httpx.Client(timeout=timeout) as client:
+            if isinstance(sink, NtfySink):
+                resp = client.post(url, content=message.encode("utf-8"),
+                                   headers={"Title": title})
+            else:
+                text = f"{title}\n{message}"
+                resp = client.post(url, json={"text": text, "content": text})
+            resp.raise_for_status()
+    except Exception as exc:
+        return str(exc) or type(exc).__name__
+    return None
 
 
 def dispatch(alerts: Sequence[Alert], sinks: Sequence[AlertSink]) -> dict:

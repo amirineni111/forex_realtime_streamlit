@@ -15,7 +15,7 @@ from forex.ml_sync import (
     last_completed_session_date, live_progress, reconcile_due, reconcile_session,
     sync_due, sync_predictions,
 )
-from forex.alerts import WebhookSink
+from forex.alerts import make_sink
 from forex.model import MIN_TRAIN_SAMPLES
 from forex.models import ScanRequest
 from forex.oanda import OandaClient
@@ -783,9 +783,10 @@ def _render_sidebar() -> tuple:
         "Webhook URL (optional)",
         value=st.session_state.get("alert_webhook", ""),
         type="password",
-        placeholder="https://hooks.slack.com/services/…",
-        help="Slack, Discord or any endpoint accepting JSON. Leave blank to keep "
-             "alerts inside the dashboard.",
+        placeholder="https://ntfy.sh/your-private-topic",
+        help="ntfy topic URL (phone push via the ntfy app), Slack, Discord or any "
+             "endpoint accepting JSON. Blank = FOREX_ALERT_WEBHOOK_URL from .env, "
+             "or dashboard-only alerts if that is unset too.",
     )
     st.session_state.alerts_enabled = alerts_enabled
     st.session_state.alert_webhook = webhook_url
@@ -817,11 +818,16 @@ def _alert_sinks() -> list:
     The dashboard feed is not a sink — alerts are persisted by the scanner before
     any sink runs, so the feed shows everything that was raised whether or not the
     webhook was reachable.
+
+    A blank sidebar URL falls back to FOREX_ALERT_WEBHOOK_URL: the dashboard and
+    the headless runner share the alert dedupe, so an alert the dashboard raised
+    without pushing would never reach the phone from the runner either.
     """
     if not st.session_state.get("alerts_enabled", True):
         return []
-    url = (st.session_state.get("alert_webhook") or "").strip()
-    return [WebhookSink(url)] if url else []
+    url = (st.session_state.get("alert_webhook") or "").strip() or get_settings().alert_webhook_url
+    sink = make_sink(url)
+    return [sink] if sink else []
 
 
 def _render_alerts_tab(storage: Storage) -> None:

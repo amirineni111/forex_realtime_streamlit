@@ -11,6 +11,10 @@ class AppSettings(BaseModel):
     oanda_env: str = "practice"
     db_path: Path = Path("data/forex_data.sqlite3")
     request_timeout_seconds: float = 20.0
+    # Push endpoint for alerts: an ntfy topic URL (phone push), a Slack/Discord
+    # webhook, or any URL taking a JSON POST. The dashboard sidebar overrides it;
+    # the headless runner (scripts/run_alerts.py) uses it directly.
+    alert_webhook_url: str = ""
 
     # ── Daily ML prediction source (SQL Server, written by sqlserver_copilot_forex) ──
     # Read-only, and read rarely: predictions land once per weekday after the
@@ -49,6 +53,7 @@ def get_settings() -> AppSettings:
         oanda_account_id=os.getenv("OANDA_ACCOUNT_ID") or None,
         oanda_env=os.getenv("OANDA_ENV", "practice"),
         db_path=Path(os.path.expandvars(raw_db)),
+        alert_webhook_url=(os.getenv("FOREX_ALERT_WEBHOOK_URL") or "").strip(),
         sql_server=os.getenv("SQL_SERVER") or None,
         sql_database=os.getenv("SQL_DATABASE") or None,
         sql_username=os.getenv("SQL_USERNAME") or None,
