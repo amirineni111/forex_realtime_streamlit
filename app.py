@@ -871,7 +871,7 @@ def _render_alerts_tab(storage: Storage) -> None:
         "session": "Session", "reason": "Notes",
     })
     st.dataframe(
-        view, width="stretch", hide_index=True,
+        view, use_container_width=True, hide_index=True,
         height=_grid_height(len(view), st.session_state.table_rows),
         column_config={
             "When": st.column_config.DatetimeColumn(format="MMM DD HH:mm"),
