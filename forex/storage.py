@@ -322,6 +322,15 @@ class Storage:
             "forex_models": [
                 ("is_shadow", "INTEGER DEFAULT 0"),
             ],
+            # An alert's own lifecycle, resolved against its own bracket. Not borrowed
+            # from forex_signal_tracking: that ledger dedupes on open pair+direction, so
+            # the tracked row can carry older levels than the alert that was pushed.
+            "forex_alerts": [
+                ("status", "TEXT DEFAULT 'open'"),
+                ("exit_price", "REAL"),
+                ("exit_reason", "TEXT"),
+                ("exit_ts", "TEXT"),
+            ],
             # tracking_id closes the loop: an outcome can now be joined back to the
             # exact feature vector that produced it.
             "forex_trade_outcomes": [
@@ -739,6 +748,76 @@ class Storage:
         params.append(limit)
         with self._connect() as conn:
             return [dict(r) for r in conn.execute(sql, params).fetchall()]
+
+    def evaluate_alerts(
+        self, pair: str, bars: List[dict], max_hold_hours: float = 12.0,
+    ) -> int:
+        """
+        Close open alerts for ``pair`` whose stop or target was touched by a bar that
+        opened after the alert was raised, or that have outlived ``max_hold_hours``
+        (closed at the last bar's close). Same stop-first convention as
+        ``evaluate_tracked_signals``. Returns the number of alerts closed.
+        """
+        with self._connect() as conn:
+            open_rows = [dict(r) for r in conn.execute(
+                "SELECT id, created_at, direction, stop, target FROM forex_alerts "
+                "WHERE pair=? AND COALESCE(status,'open')='open'", (pair,)
+            ).fetchall()]
+        if not open_rows:
+            return 0
+
+        now = datetime.now(timezone.utc)
+        parsed = [(self._parse_dt(b.get("timestamp")), b) for b in bars]
+        closed = 0
+        for row in open_rows:
+            created = self._parse_dt(row.get("created_at"))
+            stop, target = row.get("stop"), row.get("target")
+            if created is None or stop is None or target is None:
+                continue
+            forward = [b for ts, b in parsed if ts is not None and ts > created]
+            long_side = (row.get("direction") or 1) == 1
+            aged_out = (now - created).total_seconds() > max_hold_hours * 3600
+
+            exit_price = exit_reason = exit_ts = None
+            if len(forward) == len(parsed):
+                # The bars start after the alert fired, so an earlier touch would be
+                # invisible — resolving on what's left could book the wrong exit.
+                if aged_out:
+                    with self._connect() as conn:
+                        conn.execute(
+                            "UPDATE forex_alerts SET status='closed', exit_reason='EXPIRED' "
+                            "WHERE id=?", (row["id"],),
+                        )
+                    closed += 1
+                continue
+
+            for b in forward:
+                hit_stop = b["low"] <= stop if long_side else b["high"] >= stop
+                hit_target = b["high"] >= target if long_side else b["low"] <= target
+                if hit_stop:
+                    exit_price, exit_reason = stop, "STOP"
+                elif hit_target:
+                    exit_price, exit_reason = target, "TARGET"
+                else:
+                    continue
+                exit_ts = b.get("timestamp")
+                break
+
+            if exit_reason is None:
+                if forward and aged_out:
+                    exit_price, exit_reason = forward[-1]["close"], "TIMEOUT"
+                    exit_ts = forward[-1].get("timestamp")
+                else:
+                    continue
+
+            with self._connect() as conn:
+                conn.execute(
+                    "UPDATE forex_alerts SET status='closed', exit_price=?, "
+                    "exit_reason=?, exit_ts=? WHERE id=?",
+                    (exit_price, exit_reason, exit_ts, row["id"]),
+                )
+            closed += 1
+        return closed
 
     def acknowledge_alert(self, alert_id: int) -> None:
         with self._connect() as conn:

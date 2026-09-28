@@ -862,8 +862,20 @@ def _render_alerts_tab(storage: Storage) -> None:
     df["Risk"] = df["stop_pips"].map(lambda v: f"{v:.0f}p" if pd.notna(v) else "—")
     df["Reward"] = df["target_pips"].map(lambda v: f"{v:.0f}p" if pd.notna(v) else "—")
     df["Cost"] = df["cost_ratio"].map(lambda v: f"{v:.1%}" if pd.notna(v) else "—")
+
+    # Open alerts show the latest scanned mid; closed ones freeze at their exit price.
+    mids = {
+        q["pair"]: (q["bid"] + q["ask"]) / 2
+        for q in storage.load_latest_quotes()
+        if q.get("bid") is not None and q.get("ask") is not None
+    }
+    is_open = df["status"].fillna("open") == "open"
+    df["Curr / Close"] = df["exit_price"].where(~is_open, df["pair"].map(mids))
+    df["Status"] = df["exit_reason"].fillna("").str.title().where(~is_open, "Open")
+
     view = df[[
         "When", "urgency", "pair", "Side", "entry", "stop", "target",
+        "Curr / Close", "Status",
         "Risk", "Reward", "Cost", "total_score", "regime", "session", "reason",
     ]].rename(columns={
         "urgency": "Urgency", "pair": "Pair", "entry": "Entry", "stop": "Stop",
@@ -878,6 +890,11 @@ def _render_alerts_tab(storage: Storage) -> None:
             "Entry": st.column_config.NumberColumn(format="%.5f"),
             "Stop": st.column_config.NumberColumn(format="%.5f"),
             "Target": st.column_config.NumberColumn(format="%.5f"),
+            "Curr / Close": st.column_config.NumberColumn(
+                format="%.5f",
+                help="Latest scanned mid while the alert is open; the exit price once "
+                     "its stop or target is hit, or it times out.",
+            ),
             "Score": st.column_config.NumberColumn(format="%.0f"),
         },
     )

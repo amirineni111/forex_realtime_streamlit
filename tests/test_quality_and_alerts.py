@@ -9,6 +9,7 @@ relationship is what must not silently flip.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -289,3 +290,66 @@ class TestAlertStorage:
         alert_id = store.record_alert(_alert())
         store.acknowledge_alert(alert_id)
         assert store.load_alerts()[0]["acknowledged_at"] is not None
+
+
+class TestAlertResolution:
+    """An alert closes on its own bracket and freezes the exit price for the feed."""
+
+    @staticmethod
+    def _armed(store, minutes_ago=30):
+        alert_id = store.record_alert(_alert())
+        with store._connect() as conn:
+            conn.execute(
+                "UPDATE forex_alerts SET created_at=datetime('now', ?) WHERE id=?",
+                (f"-{minutes_ago} minutes", alert_id),
+            )
+        return store.load_alerts()[0]
+
+    @staticmethod
+    def _bar(minutes_ago, high, low, close):
+        ts = datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)
+        return {"timestamp": ts.strftime("%Y-%m-%dT%H:%M:%S.000000000Z"),
+                "high": high, "low": low, "close": close}
+
+    def test_new_alert_starts_open(self, store):
+        assert self._armed(store)["status"] == "open"
+
+    def test_target_touch_closes_at_target(self, store):
+        row = self._armed(store)
+        mid = (row["stop"] + row["target"]) / 2
+        bars = [self._bar(40, mid, mid, mid),                 # before the alert
+                self._bar(20, row["target"] + 1e-4, mid, mid)]
+        assert store.evaluate_alerts("EUR_USD", bars) == 1
+        closed = store.load_alerts()[0]
+        assert closed["status"] == "closed"
+        assert closed["exit_reason"] == "TARGET"
+        assert closed["exit_price"] == row["target"]
+
+    def test_stop_wins_when_one_bar_spans_both(self, store):
+        row = self._armed(store)
+        bars = [self._bar(40, row["entry"], row["entry"], row["entry"]),
+                self._bar(20, row["target"] + 1e-4, row["stop"] - 1e-4, row["entry"])]
+        store.evaluate_alerts("EUR_USD", bars)
+        assert store.load_alerts()[0]["exit_reason"] == "STOP"
+
+    def test_untouched_alert_stays_open(self, store):
+        row = self._armed(store)
+        bars = [self._bar(40, row["entry"], row["entry"], row["entry"]),
+                self._bar(20, row["entry"], row["entry"], row["entry"])]
+        assert store.evaluate_alerts("EUR_USD", bars) == 0
+        assert store.load_alerts()[0]["status"] == "open"
+
+    def test_bars_before_the_alert_are_ignored(self, store):
+        row = self._armed(store)
+        bars = [self._bar(40, row["target"] + 1e-4, row["entry"], row["entry"]),
+                self._bar(20, row["entry"], row["entry"], row["entry"])]
+        assert store.evaluate_alerts("EUR_USD", bars) == 0
+
+    def test_aged_out_alert_without_bar_coverage_expires_without_a_price(self, store):
+        self._armed(store, minutes_ago=24 * 60)
+        row = store.load_alerts()[0]
+        bars = [self._bar(20, row["entry"], row["entry"], row["entry"])]
+        assert store.evaluate_alerts("EUR_USD", bars, max_hold_hours=12) == 1
+        closed = store.load_alerts()[0]
+        assert closed["exit_reason"] == "EXPIRED"
+        assert closed["exit_price"] is None

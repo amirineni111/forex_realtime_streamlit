@@ -378,6 +378,12 @@ def run_scan(
                 )
             except Exception as exc:
                 storage.log_pair(scan_id, s.pair, None, f"Tracking eval failed: {exc}")
+            try:
+                storage.evaluate_alerts(
+                    s.pair, pair_bars, max_hold_hours=request.max_hold_hours,
+                )
+            except Exception as exc:
+                storage.log_pair(scan_id, s.pair, None, f"Alert eval failed: {exc}")
 
         storage.log_pair(scan_id, s.pair, s.trade_signal, None)
         if s.trade_signal not in ("AVOID", "WATCH_ONLY"):
