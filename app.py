@@ -1283,7 +1283,41 @@ def _page_scanner(
 
             fdf_display = fdf.copy()
             fdf_display["pair"] = fdf_display["pair"].apply(format_pair)
-            _dim_table(fdf_display, "pair", "Pair")
+
+            wr_view = st.radio("Win rate by", ["Pair", "Date"], horizontal=True, key="perf_wr_view")
+            if wr_view == "Pair":
+                _dim_table(fdf_display, "pair", "Pair")
+            else:
+                # Every trade, grouped by day, newest day (and newest trade) first
+                st.subheader("Win Rate by Date")
+                fdf_display["created_at (ET)"] = (
+                    pd.to_datetime(fdf_display["created_at"], errors="coerce", utc=True)
+                    .dt.tz_convert("America/New_York")
+                )
+                trade_cols = [c for c in [
+                    "created_at", "created_at (ET)", "pair", "signal", "outcome", "r_multiple", "exit_pips",
+                    "entry_price", "exit_price", "hold_minutes",
+                ] if c in fdf_display.columns]
+                by_date = fdf_display.sort_values("created_at", ascending=False)
+                for i, (day, day_df) in enumerate(by_date.groupby("date", sort=False)):
+                    n = len(day_df)
+                    d_wins = int((day_df["outcome"] == "WIN").sum())
+                    d_losses = int((day_df["outcome"] == "LOSS").sum())
+                    d_r = day_df["r_multiple"].fillna(0).sum()
+                    label = (
+                        f"{day} — {n} trades · {d_wins}W / {d_losses}L · "
+                        f"{d_wins / n * 100:.1f}% WR · {d_r:+.1f}R"
+                    )
+                    with st.expander(label, expanded=(i == 0)):
+                        st.dataframe(
+                            day_df[trade_cols], use_container_width=True, hide_index=True,
+                            column_config={
+                                "created_at (ET)": st.column_config.DatetimeColumn(
+                                    format="MMM DD HH:mm",
+                                    help="US Eastern time; follows daylight saving (EDT in summer, EST in winter).",
+                                ),
+                            },
+                        )
             _dim_table(fdf_display, "signal", "Signal")
 
             # Recent trade log
