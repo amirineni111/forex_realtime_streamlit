@@ -858,6 +858,7 @@ def _render_alerts_tab(storage: Storage) -> None:
 
     df = pd.DataFrame(rows)
     df["When"] = pd.to_datetime(df["created_at"], errors="coerce", utc=True)
+    df["When (ET)"] = df["When"].dt.tz_convert("America/New_York")
     df["Side"] = df["direction"].map(_direction_label)
     df["Risk"] = df["stop_pips"].map(lambda v: f"{v:.0f}p" if pd.notna(v) else "—")
     df["Reward"] = df["target_pips"].map(lambda v: f"{v:.0f}p" if pd.notna(v) else "—")
@@ -874,11 +875,11 @@ def _render_alerts_tab(storage: Storage) -> None:
     df["Status"] = df["exit_reason"].fillna("").str.title().where(~is_open, "Open")
 
     view = df[[
-        "When", "urgency", "pair", "Side", "entry", "stop", "target",
+        "When", "When (ET)", "urgency", "pair", "Side", "entry", "stop", "target",
         "Curr / Close", "Status",
         "Risk", "Reward", "Cost", "total_score", "regime", "session", "reason",
     ]].rename(columns={
-        "urgency": "Urgency", "pair": "Pair", "entry": "Entry", "stop": "Stop",
+        "When": "When (UTC)", "urgency": "Urgency", "pair": "Pair", "entry": "Entry", "stop": "Stop",
         "target": "Target", "total_score": "Score", "regime": "Regime",
         "session": "Session", "reason": "Notes",
     })
@@ -886,7 +887,11 @@ def _render_alerts_tab(storage: Storage) -> None:
         view, use_container_width=True, hide_index=True,
         height=_grid_height(len(view), st.session_state.table_rows),
         column_config={
-            "When": st.column_config.DatetimeColumn(format="MMM DD HH:mm"),
+            "When (UTC)": st.column_config.DatetimeColumn(format="MMM DD HH:mm"),
+            "When (ET)": st.column_config.DatetimeColumn(
+                format="MMM DD HH:mm",
+                help="US Eastern time; follows daylight saving (EDT in summer, EST in winter).",
+            ),
             "Entry": st.column_config.NumberColumn(format="%.5f"),
             "Stop": st.column_config.NumberColumn(format="%.5f"),
             "Target": st.column_config.NumberColumn(format="%.5f"),
