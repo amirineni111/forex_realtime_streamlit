@@ -19,7 +19,7 @@ from forex.alerts import make_sink
 from forex.model import MIN_TRAIN_SAMPLES
 from forex.models import ScanRequest
 from forex.oanda import OandaClient
-from forex.pairs import UNIVERSE_MAP, format_pair
+from forex.pairs import UNIVERSE_MAP, format_pair, tradingview_url
 from forex.scanner import run_scan
 from forex.storage import Storage
 from forex.strength import calculate_strength, CURRENCIES
@@ -74,6 +74,32 @@ def _grid_height(row_count: int, max_rows: int | None = None) -> int:
     limit = max_rows or st.session_state.get("table_rows", DEFAULT_TABLE_ROWS)
     visible = max(1, min(int(row_count or 1), int(limit)))
     return GRID_HEADER_PX + visible * GRID_ROW_PX
+
+
+# ── Pair links ───────────────────────────────────────────────────────────────
+
+# TradingView's interval codes for the timeframes the scanner can signal on.
+_TV_INTERVALS = {"M5": "5", "M15": "15", "H1": "60"}
+
+# Every pair cell holds a TradingView URL whose fragment is the display name
+# (see ``tradingview_url``); the column shows the fragment and opens the chart
+# in a new tab on click.
+PAIR_LINK_COLUMN = st.column_config.LinkColumn(
+    display_text=r"#(.+)$",
+    help="Click to open the pair's chart on TradingView.",
+)
+
+
+def _pair_link(pair: str, interval: str | None = None) -> str:
+    """Chart link for a pair cell; defaults to the scanner's signal timeframe."""
+    if interval is None:
+        interval = _TV_INTERVALS.get(st.session_state.get("signal_timeframe", "M15"), "15")
+    return tradingview_url(pair, interval)
+
+
+def _daily_pair_link(pair: str) -> str:
+    """Daily chart — the horizon the SQL Server ML model predicts on."""
+    return tradingview_url(pair, "D")
 
 
 # ── Session state init ───────────────────────────────────────────────────────
@@ -305,7 +331,7 @@ def _render_ml_prediction_box(settings: AppSettings, storage: Storage) -> None:
         df["Lean"] = df.apply(
             lambda r: _direction_label(implied_direction(r["prob_buy"], r["prob_sell"])), axis=1
         )
-        df["Pair"] = df["pair"].apply(format_pair)
+        df["Pair"] = df["pair"].apply(_daily_pair_link)
 
         # Live leg: where price sits *now* against the close the model predicted
         # from. Refreshed with the page, so the static morning call and the
@@ -368,6 +394,7 @@ def _render_ml_prediction_box(settings: AppSettings, storage: Storage) -> None:
         st.dataframe(
             styled, use_container_width=True, hide_index=True,
             height=_grid_height(len(display)),
+            column_config={"Pair": PAIR_LINK_COLUMN},
         )
 
         last_sync = storage.load_ml_last_sync(kind="predictions")
@@ -507,7 +534,7 @@ def _render_reconcile_tab(settings: AppSettings, storage: Storage) -> None:
             )
 
         display = pd.DataFrame({
-            "Pair": df["pair"].apply(format_pair),
+            "Pair": df["pair"].apply(_daily_pair_link),
             "Predicted": df["predicted_signal"].apply(_ml_signal_badge),
             "Conf": df["signal_confidence"],
             "Lean": df["implied_direction"].apply(_direction_label),
@@ -534,6 +561,7 @@ def _render_reconcile_tab(settings: AppSettings, storage: Storage) -> None:
             .apply(_shade, axis=1),
             use_container_width=True, hide_index=True,
             height=_grid_height(len(display)),
+            column_config={"Pair": PAIR_LINK_COLUMN},
         )
 
         # Feed cross-check: the mirror's base close comes from SQL Server's own
@@ -612,7 +640,7 @@ def _render_reconcile_tab(settings: AppSettings, storage: Storage) -> None:
             pair_df = pd.DataFrame(by_pair)
             st.dataframe(
                 pd.DataFrame({
-                    "Pair": pair_df["pair"].apply(format_pair),
+                    "Pair": pair_df["pair"].apply(_daily_pair_link),
                     "Sessions": pair_df["sessions"],
                     "Signals": pair_df["signal_calls"],
                     "Signal hit rate": pair_df.apply(
@@ -623,6 +651,7 @@ def _render_reconcile_tab(settings: AppSettings, storage: Storage) -> None:
                     {"Signal hit rate": "{:.0%}", "Lean hit rate": "{:.0%}"}, na_rep="—"
                 ),
                 use_container_width=True, hide_index=True,
+                column_config={"Pair": PAIR_LINK_COLUMN},
             )
 
 
@@ -873,13 +902,14 @@ def _render_alerts_tab(storage: Storage) -> None:
     is_open = df["status"].fillna("open") == "open"
     df["Curr / Close"] = df["exit_price"].where(~is_open, df["pair"].map(mids))
     df["Status"] = df["exit_reason"].fillna("").str.title().where(~is_open, "Open")
+    df["Pair"] = df["pair"].map(_pair_link)
 
     view = df[[
-        "When", "When (ET)", "urgency", "pair", "Side", "entry", "stop", "target",
+        "When", "When (ET)", "urgency", "Pair", "Side", "entry", "stop", "target",
         "Curr / Close", "Status",
         "Risk", "Reward", "Cost", "total_score", "regime", "session", "reason",
     ]].rename(columns={
-        "When": "When (UTC)", "urgency": "Urgency", "pair": "Pair", "entry": "Entry", "stop": "Stop",
+        "When": "When (UTC)", "urgency": "Urgency", "entry": "Entry", "stop": "Stop",
         "target": "Target", "total_score": "Score", "regime": "Regime",
         "session": "Session", "reason": "Notes",
     })
@@ -887,6 +917,7 @@ def _render_alerts_tab(storage: Storage) -> None:
         view, use_container_width=True, hide_index=True,
         height=_grid_height(len(view), st.session_state.table_rows),
         column_config={
+            "Pair": PAIR_LINK_COLUMN,
             "When (UTC)": st.column_config.DatetimeColumn(format="MMM DD HH:mm"),
             "When (ET)": st.column_config.DatetimeColumn(
                 format="MMM DD HH:mm",
@@ -1056,8 +1087,10 @@ def _page_scanner(
                 "current_session", "signal_reason", "as_of",
             ]
             display = filtered[[c for c in display_cols if c in filtered.columns]].copy()
-            display["pair"] = display["pair"].apply(format_pair)
             display["trade_signal"] = display["trade_signal"].apply(_signal_badge)
+            # The export keeps the readable pair; the grid cell becomes a chart link.
+            export_csv = display.assign(pair=display["pair"].apply(format_pair)).to_csv(index=False)
+            display["pair"] = display["pair"].apply(_pair_link)
 
             def _fmt5(x):
                 try:
@@ -1098,6 +1131,7 @@ def _page_scanner(
             st.dataframe(
                 styled, use_container_width=True, hide_index=True,
                 height=_grid_height(len(display)),
+                column_config={"pair": PAIR_LINK_COLUMN},
             )
 
             # Column guide
@@ -1105,7 +1139,7 @@ def _page_scanner(
                 st.markdown("""
 | Column | Description |
 |--------|-------------|
-| pair | Currency pair (e.g. EUR/USD) |
+| pair | Currency pair (e.g. EUR/USD) — click to open its TradingView chart |
 | trade_signal | Overall signal: STRONG_BUY, BUY_CANDIDATE, SHORT_CANDIDATE, STRONG_SHORT, WATCH_ONLY, AVOID |
 | total_score | Combined score (momentum/reversion 0–40 + session 0–20 + MTF 0–30 + S/R −25…+25 + strength ±10) |
 | model_prob | Trained model's P(target before stop). Blank until a model is activated |
@@ -1138,7 +1172,7 @@ def _page_scanner(
 
             st.download_button(
                 "Export CSV",
-                display.to_csv(index=False).encode(),
+                export_csv.encode(),
                 file_name="forex_scan.csv",
                 mime="text/csv",
             )
@@ -1174,10 +1208,11 @@ def _page_scanner(
             st.info("No active watches.")
         else:
             wdf = pd.DataFrame(watching)
-            wdf["pair"] = wdf["pair"].apply(format_pair)
+            wdf["pair"] = wdf["pair"].apply(_pair_link)
             if "signal" in wdf.columns:
                 wdf["signal"] = wdf["signal"].apply(lambda s: _signal_badge(s) if s else s)
-            st.dataframe(wdf, use_container_width=True, hide_index=True)
+            st.dataframe(wdf, use_container_width=True, hide_index=True,
+                         column_config={"pair": PAIR_LINK_COLUMN})
 
             cc1, cc2 = st.columns(2)
             close_id = cc1.number_input("Close watch ID", min_value=0, step=1, value=0)
@@ -1195,8 +1230,9 @@ def _page_scanner(
             closed = storage.load_watchlist("closed")
             if closed:
                 cdf = pd.DataFrame(closed)
-                cdf["pair"] = cdf["pair"].apply(format_pair)
-                st.dataframe(cdf, use_container_width=True, hide_index=True)
+                cdf["pair"] = cdf["pair"].apply(_pair_link)
+                st.dataframe(cdf, use_container_width=True, hide_index=True,
+                             column_config={"pair": PAIR_LINK_COLUMN})
 
     # ── Performance tab ───────────────────────────────────────────────────────
     with tab_perf:
@@ -1279,10 +1315,11 @@ def _page_scanner(
                 st.dataframe(
                     grp[[label, "Trades", "Wins", "Win Rate", "Expectancy"]],
                     use_container_width=True, hide_index=True,
+                    column_config={"Pair": PAIR_LINK_COLUMN},
                 )
 
             fdf_display = fdf.copy()
-            fdf_display["pair"] = fdf_display["pair"].apply(format_pair)
+            fdf_display["pair"] = fdf_display["pair"].apply(_pair_link)
 
             wr_view = st.radio("Win rate by", ["Pair", "Date"], horizontal=True, key="perf_wr_view")
             if wr_view == "Pair":
@@ -1312,6 +1349,7 @@ def _page_scanner(
                         st.dataframe(
                             day_df[trade_cols], use_container_width=True, hide_index=True,
                             column_config={
+                                "pair": PAIR_LINK_COLUMN,
                                 "created_at (ET)": st.column_config.DatetimeColumn(
                                     format="MMM DD HH:mm",
                                     help="US Eastern time; follows daylight saving (EDT in summer, EST in winter).",
@@ -1322,21 +1360,23 @@ def _page_scanner(
 
             # Recent trade log
             with st.expander("Trade History"):
-                st.dataframe(fdf_display, use_container_width=True, hide_index=True)
+                st.dataframe(fdf_display, use_container_width=True, hide_index=True,
+                             column_config={"pair": PAIR_LINK_COLUMN})
 
         # Open auto-tracked signals (forward-testing in progress)
         open_tracked = storage.load_tracked_signals("open")
         if open_tracked:
             with st.expander(f"Open Tracked Signals ({len(open_tracked)})"):
                 tdf = pd.DataFrame(open_tracked)
-                tdf["pair"] = tdf["pair"].apply(format_pair)
+                tdf["pair"] = tdf["pair"].apply(_pair_link)
                 keep = [c for c in [
                     "pair", "signal", "model_prob", "required_prob", "total_score",
                     "entry_price", "stop_price", "target_price",
                     "stop_pips", "target_pips", "cost_ratio", "spread_pips",
                     "session", "regime", "entry_ts", "created_at",
                 ] if c in tdf.columns]
-                st.dataframe(tdf[keep], use_container_width=True, hide_index=True)
+                st.dataframe(tdf[keep], use_container_width=True, hide_index=True,
+                             column_config={"pair": PAIR_LINK_COLUMN})
                 st.caption("Each scan checks these against their ATR stop/target; a touch records a WIN/LOSS outcome.")
 
     # ── Model tab ────────────────────────────────────────────────────────────
@@ -1708,7 +1748,7 @@ def _page_live_quotes(settings: AppSettings, storage: Storage, selected_pairs: l
         st.info("No live quotes yet. Click 'Fetch Quotes' or wait for auto-refresh.")
     else:
         qdf = pd.DataFrame(quotes)
-        qdf["pair"] = qdf["pair"].apply(format_pair)
+        qdf["pair"] = qdf["pair"].apply(_pair_link)
         qdf["mid"] = ((qdf["bid"] + qdf["ask"]) / 2).round(6)
 
         # Highlight London/NY overlap rows
@@ -1731,10 +1771,11 @@ def _page_live_quotes(settings: AppSettings, storage: Storage, selected_pairs: l
             use_container_width=True,
             hide_index=True,
             height=_grid_height(len(display)),
+            column_config={"pair": PAIR_LINK_COLUMN},
         )
 
         st.caption(
-            f"Session: {session.replace('_', ' ')} | "
+            f"Session:{session.replace('_', ' ')} | "
             f"Market open: {'Yes' if is_forex_market_open() else 'No (weekend)'} | "
             f"Last refresh: {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}"
         )

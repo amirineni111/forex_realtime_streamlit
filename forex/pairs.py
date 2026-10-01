@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 
 MAJOR_PAIRS: List[str] = [
     "EUR_USD", "GBP_USD", "USD_JPY", "USD_CHF",
@@ -43,6 +43,21 @@ def spread_to_pips(pair: str, spread: float) -> float:
 def format_pair(pair: str) -> str:
     """Convert EUR_USD to EUR/USD for display."""
     return pair.replace("_", "/")
+
+
+def tradingview_url(pair: str, interval: Optional[str] = None) -> str:
+    """
+    TradingView chart link for a pair, on OANDA's own feed.
+
+    The display form (``EUR/USD``) rides along as the URL fragment: TradingView
+    ignores it, and the dashboard's link columns read it back as the cell text,
+    so a grid can show the pair while the cell itself is the link.
+    """
+    oanda = to_oanda_pair(pair)
+    url = f"https://www.tradingview.com/chart/?symbol=OANDA%3A{oanda.replace('_', '')}"
+    if interval:
+        url += f"&interval={interval}"
+    return f"{url}#{format_pair(oanda)}"
 
 
 def pip_value(pair: str) -> float:
